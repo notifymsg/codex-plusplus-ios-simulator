@@ -1,0 +1,6 @@
+# Compiled helper binaries (rebuilt on first run by the tweak)
+helpers/sim-capture
+helpers/sim-input
+
+# macOS cruft
+.DS_Store
