@@ -18,6 +18,8 @@
 const TWEAK_ATTR = "data-codexpp-ios-sim";
 const STYLE_ID = "codexpp-ios-sim-style";
 const RENDERER_STATE_KEY = "__codexpp_ios_sim_renderer_state__";
+const SESSION_PANEL_OPEN_KEY = "__codexpp_ios_sim_panel_open__";
+const TABLIST_WIRE_VERSION = "ios-sim-tab-selection-v2";
 const MENU_LABEL = "iOS Simulator";
 const PANEL_LABEL = "iOS Simulator";
 const BROWSER_PATTERNS = [/^browser$/i, /^browser use$/i, /\bbrowser\b/i];
@@ -96,13 +98,14 @@ module.exports = {
 
     injectStyles();
     rendererState.cleanup.push(() => document.getElementById(STYLE_ID)?.remove());
-    rendererState.cleanup.push(() => removeSimPanel());
+    rendererState.cleanup.push(() => removeSimPanel({ preserveOpenState: true }));
     registerSettingsPage(rendererState);
 
     await api.react.waitForElement?.("body", 10_000);
 
     rendererState.observer = new MutationObserver(() => {
       this.installMenuEntries();
+      reconcileNativeSelection(rendererState);
       if (rendererState.panelOpen) {
         scheduleOpenPanelReconcile(rendererState);
       }
@@ -112,6 +115,9 @@ module.exports = {
 
     installOpenShortcut(rendererState);
     this.installMenuEntries();
+    if (readStoredPanelOpen()) {
+      restoreOpenPanel(rendererState);
+    }
   },
 
   stop() {
@@ -125,7 +131,7 @@ module.exports = {
     }
     this.cleanup = [];
     document.querySelectorAll(`[${TWEAK_ATTR}]`).forEach((node) => node.remove());
-    removeSimPanel();
+    removeSimPanel({ preserveOpenState: true });
     if (globalThis[RENDERER_STATE_KEY] === this._rendererState) {
       delete globalThis[RENDERER_STATE_KEY];
     }
@@ -174,16 +180,58 @@ function disposeRendererState(state) {
   state.pageHandle?.unregister?.();
   state.pageHandle = null;
   document.querySelectorAll(`[${TWEAK_ATTR}]`).forEach((node) => node.remove());
-  removeSimPanel();
+  removeSimPanel({ preserveOpenState: true });
 }
 
 function currentRendererState() {
   return globalThis[RENDERER_STATE_KEY] || null;
 }
 
-function setPanelOpen(value) {
+function setPanelOpen(value, options = {}) {
   const state = currentRendererState();
   if (state) state.panelOpen = Boolean(value);
+  if (options.preserveOpenState) return;
+  try {
+    if (value) sessionStorage.setItem(SESSION_PANEL_OPEN_KEY, "1");
+    else sessionStorage.removeItem(SESSION_PANEL_OPEN_KEY);
+  } catch {}
+}
+
+function readStoredPanelOpen() {
+  try {
+    return sessionStorage.getItem(SESSION_PANEL_OPEN_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
+function restoreOpenPanel(state) {
+  if (!state?.api || state.__restoreTimer) return;
+  let attempts = 0;
+  const tick = () => {
+    state.__restoreTimer = null;
+    if (state.disposed || !readStoredPanelOpen()) return;
+    setPanelOpen(true);
+    ensureSidePanelVisible();
+    if (mountSimPanel(state.api)) return;
+    attempts += 1;
+    if (attempts >= 80) {
+      state.api?.log?.warn?.("ios-sim restore gave up waiting for side panel host");
+      return;
+    }
+    state.__restoreTimer = window.setTimeout(tick, attempts < 10 ? 100 : 250);
+  };
+  tick();
+}
+
+function reconcileNativeSelection(state) {
+  if (!state?.panelOpen) return;
+  const tablist = findRightTablist();
+  const panelHost = tablist?.closest?.(".flex.h-full.min-h-0.flex-col");
+  if (!(panelHost instanceof HTMLElement)) return;
+  const activeNative = findActiveNativeRightTab(panelHost);
+  if (!activeNative) return;
+  deactivateSimPanel(panelHost, { activateNativeTab: activeNative });
 }
 
 function scheduleOpenPanelReconcile(state) {
@@ -193,6 +241,7 @@ function scheduleOpenPanelReconcile(state) {
     if (state.disposed || !state.panelOpen) return;
     if (isSimPanelMounted()) return;
     try {
+      ensureSidePanelVisible();
       mountSimPanel(state.api);
     } catch (error) {
       state.api?.log?.warn?.("ios-sim reconcile failed", String(error?.stack || error));
@@ -204,6 +253,19 @@ function isSimPanelMounted() {
   const tab = document.querySelector(`[${TWEAK_ATTR}="side-tab"]`);
   const panel = document.querySelector(`[${TWEAK_ATTR}="tabpanel"]`);
   return tab instanceof HTMLElement && tab.isConnected && panel instanceof HTMLElement && panel.isConnected;
+}
+
+function findActiveNativeRightTab(panelHost) {
+  for (const controller of panelHost.querySelectorAll(
+    '[data-app-shell-tab-controller="right"][data-tab-id]',
+  )) {
+    if (!(controller instanceof HTMLElement)) continue;
+    if (controller.getAttribute(TWEAK_ATTR) === "side-tab") continue;
+    const tab = controller.querySelector('[role="tab"]');
+    if (controller.getAttribute("data-selected") === "true") return controller;
+    if (tab?.getAttribute("aria-selected") === "true") return controller;
+  }
+  return null;
 }
 
 function registerSettingsPage(state) {
@@ -789,6 +851,15 @@ function injectStyles() {
     [${TWEAK_ATTR}="side-tab"][data-selected="true"] .pointer-events-none {
       background: color-mix(in oklab, var(--color-token-text-primary) 8%, transparent);
     }
+    [${TWEAK_ATTR}="side-tab"] [${TWEAK_ATTR}="close-tab"] {
+      display: none;
+    }
+    [${TWEAK_ATTR}="side-tab"]:hover [${TWEAK_ATTR}="tab-icon"] {
+      visibility: hidden;
+    }
+    [${TWEAK_ATTR}="side-tab"]:hover [${TWEAK_ATTR}="close-tab"] {
+      display: flex;
+    }
     [${TWEAK_ATTR}="tabpanel"] {
       background: var(--color-background-panel, var(--color-token-bg-fog));
     }
@@ -898,7 +969,7 @@ function isMenuCandidate(node) {
 function rewriteMenuEntry(button) {
   rewriteMenuLabel(button);
   rewriteMenuIcon(button);
-  installShortcutHint(button);
+  normalizeShortcutHint(button);
 }
 
 function rewriteMenuLabel(button) {
@@ -916,7 +987,6 @@ function rewriteMenuLabel(button) {
         .replace(/Open file/i, MENU_LABEL)
         .replace(/Browse files/i, MENU_LABEL)
         .replace(/New chat/i, MENU_LABEL);
-      removeShortcutHints(button);
       return;
     }
   }
@@ -937,7 +1007,7 @@ function rewriteMenuLabel(button) {
       break;
     }
   }
-  removeShortcutHints(button);
+  normalizeShortcutHint(button);
 }
 
 function rewriteMenuIcon(button) {
@@ -954,27 +1024,42 @@ function rewriteMenuIcon(button) {
   button.prepend(htmlToElement(PHONE_ICON));
 }
 
-function removeShortcutHints(button) {
+function normalizeShortcutHint(button) {
+  if (button.closest('[role="dialog"]')) return;
+  let firstHint = null;
   for (const node of Array.from(button.querySelectorAll("kbd, span"))) {
     const text = compactText(node.textContent || "");
     if (
       text !== MENU_LABEL &&
       (/^[⌘⇧⌥⌃^]+/.test(text) || /Cmd|Ctrl|Alt|Shift|⌘/.test(text))
     ) {
-      node.remove();
+      if (!firstHint) {
+        firstHint = node;
+        node.setAttribute(TWEAK_ATTR, "shortcut-hint");
+        node.setAttribute("aria-hidden", "true");
+        node.textContent = OPEN_SHORTCUT_LABEL;
+      } else {
+        node.remove();
+      }
     }
   }
+  if (firstHint) return;
+  installShortcutHint(button);
 }
 
 function installShortcutHint(button) {
   if (button.closest('[role="dialog"]')) return;
   if (button.querySelector(`[${TWEAK_ATTR}="shortcut-hint"]`)) return;
+  const row =
+    button.querySelector(":scope > div.flex.w-full.items-center") ||
+    button.querySelector("div.flex.w-full.items-center") ||
+    button;
   const hint = document.createElement("span");
   hint.setAttribute(TWEAK_ATTR, "shortcut-hint");
   hint.setAttribute("aria-hidden", "true");
-  hint.className = "ml-auto shrink-0 text-xs text-token-text-tertiary";
+  hint.className = "ml-2 shrink-0 text-xs text-token-description-foreground";
   hint.textContent = OPEN_SHORTCUT_LABEL;
-  button.appendChild(hint);
+  row.appendChild(hint);
 }
 
 function installOpenShortcut(state) {
@@ -1162,17 +1247,21 @@ function rewriteSideTabIcon(tabButton) {
   if (iconSlot instanceof HTMLElement) {
     if (/^(svg|img)$/i.test(iconSlot.tagName)) {
       const span = htmlToElement(PHONE_ICON);
-      span.className = "icon-xs flex shrink-0 items-center justify-center group-hover/tab:invisible";
+      span.setAttribute(TWEAK_ATTR, "tab-icon");
+      span.className = "icon-xs flex shrink-0 items-center justify-center";
       iconSlot.replaceWith(span);
       return;
     }
     iconSlot.setAttribute("aria-hidden", "true");
+    iconSlot.setAttribute(TWEAK_ATTR, "tab-icon");
     iconSlot.className =
-      "icon-xs flex shrink-0 items-center justify-center group-hover/tab:invisible";
+      "icon-xs flex shrink-0 items-center justify-center";
     iconSlot.innerHTML = PHONE_SVG;
     return;
   }
-  tabButton.prepend(htmlToElement(PHONE_ICON));
+  const icon = htmlToElement(PHONE_ICON);
+  icon.setAttribute(TWEAK_ATTR, "tab-icon");
+  tabButton.prepend(icon);
 }
 
 function rewriteSideTabLabel(tabButton) {
@@ -1274,9 +1363,10 @@ function createFallbackSideTab() {
 
   const iconSpan = document.createElement("span");
   iconSpan.setAttribute("aria-hidden", "true");
+  iconSpan.setAttribute(TWEAK_ATTR, "tab-icon");
   // Hide the phone icon on tab hover so the close-X takes its place cleanly.
   iconSpan.className =
-    "icon-xs flex shrink-0 items-center justify-center group-hover/tab:invisible";
+    "icon-xs flex shrink-0 items-center justify-center";
   iconSpan.innerHTML = PHONE_SVG;
 
   // Close button — overlays the icon's slot on hover. The SVG itself is a
@@ -1386,22 +1476,25 @@ function installTablistDrag(tablist) {
 }
 
 function installNativeTabDeactivation(tablist, panelHost) {
-  if (tablist.__codexppIosSimWired) return;
-  tablist.__codexppIosSimWired = true;
+  if (tablist.__codexppIosSimWired === TABLIST_WIRE_VERSION) return;
+  tablist.__codexppIosSimWired = TABLIST_WIRE_VERSION;
 
   const handleNativeTab = (event) => {
     const target = event.target instanceof Element ? event.target : null;
-    const tab = target?.closest?.('[role="tab"]');
-    if (!(tab instanceof HTMLElement)) return;
-    if (tab.closest(`[${TWEAK_ATTR}="side-tab"]`)) return;
-    deactivateSimPanel(panelHost);
+    const controller = target?.closest?.('[data-app-shell-tab-controller="right"][data-tab-id]');
+    const tab = target?.closest?.('[role="tab"]') || controller?.querySelector?.('[role="tab"]');
+    if (!(controller instanceof HTMLElement) && !(tab instanceof HTMLElement)) return;
+    if (target?.closest?.(`[${TWEAK_ATTR}="side-tab"]`)) return;
+    deactivateSimPanel(panelHost, {
+      activateNativeTab: controller instanceof HTMLElement ? controller : tab,
+    });
   };
 
-  tablist.addEventListener("click", handleNativeTab);
+  tablist.addEventListener("click", handleNativeTab, true);
   tablist.addEventListener("keydown", (event) => {
     if (event.key !== "Enter" && event.key !== " ") return;
     handleNativeTab(event);
-  });
+  }, true);
 }
 
 function createPanel(api) {
@@ -1633,6 +1726,8 @@ function makeToolbarButton({ label, icon, text, onClick }) {
 }
 
 function activateSimPanel(panelHost, tab, panel) {
+  setPanelOpen(true);
+  syncNativeTabSelection(panelHost, null);
   for (const nativePanel of panelHost.querySelectorAll(
     ':scope > [role="tabpanel"]',
   )) {
@@ -1644,12 +1739,6 @@ function activateSimPanel(panelHost, tab, panel) {
       );
     }
     nativePanel.style.display = "none";
-  }
-
-  for (const nativeTab of panelHost.querySelectorAll('[role="tab"]')) {
-    nativeTab.setAttribute("aria-selected", "false");
-    nativeTab.classList.remove("text-token-text-primary");
-    nativeTab.classList.add("text-token-text-secondary");
   }
 
   const tabButton = tab.querySelector('[role="tab"]');
@@ -1703,8 +1792,8 @@ function activateSimPanel(panelHost, tab, panel) {
     });
 }
 
-function deactivateSimPanel(panelHost) {
-  setPanelOpen(false);
+function deactivateSimPanel(panelHost, options = {}) {
+  setPanelOpen(false, options);
   const tabWrap = document.querySelector(`[${TWEAK_ATTR}="side-tab"]`);
   const tab = tabWrap?.querySelector('[role="tab"]');
   const panel = document.querySelector(`[${TWEAK_ATTR}="tabpanel"]`);
@@ -1731,12 +1820,34 @@ function deactivateSimPanel(panelHost) {
       nativePanel.removeAttribute("data-codexpp-ios-sim-prev-display");
     }
   }
+
+  if (options.activateNativeTab instanceof HTMLElement) {
+    syncNativeTabSelection(panelHost, options.activateNativeTab);
+  }
 }
 
-function removeSimPanel() {
-  setPanelOpen(false);
+function syncNativeTabSelection(panelHost, selectedController) {
+  for (const controller of panelHost.querySelectorAll(
+    '[data-app-shell-tab-controller="right"][data-tab-id]',
+  )) {
+    if (!(controller instanceof HTMLElement)) continue;
+    if (controller.getAttribute(TWEAK_ATTR) === "side-tab") continue;
+    const selected = controller === selectedController || controller.contains(selectedController);
+    if (selected) controller.dataset.selected = "true";
+    else controller.removeAttribute("data-selected");
+    const tab = controller.querySelector('[role="tab"]');
+    if (tab instanceof HTMLElement) {
+      tab.setAttribute("aria-selected", selected ? "true" : "false");
+      tab.classList.toggle("text-token-text-primary", selected);
+      tab.classList.toggle("text-token-text-secondary", !selected);
+    }
+  }
+}
+
+function removeSimPanel(options = {}) {
+  setPanelOpen(false, options);
   const panelHost = findRightTablist()?.closest(".flex.h-full.min-h-0.flex-col");
-  if (panelHost instanceof HTMLElement) deactivateSimPanel(panelHost);
+  if (panelHost instanceof HTMLElement) deactivateSimPanel(panelHost, options);
   document.querySelector(`[${TWEAK_ATTR}="side-tab"]`)?.remove();
   document.querySelector(`[${TWEAK_ATTR}="tabpanel"]`)?.remove();
 }
@@ -1752,13 +1863,22 @@ function ensureSidePanelVisible() {
 
 function findLikelySidePanelOpenButton() {
   const buttons = Array.from(document.querySelectorAll("button[aria-label]"));
+  const rightEdgeToggle = Array.from(document.querySelectorAll("button")).find((button) => {
+    if (!(button instanceof HTMLElement)) return false;
+    if (button.getAttribute("aria-label") || button.title || compactText(button.textContent || "")) return false;
+    const rect = button.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0 || rect.top > 80) return false;
+    if (rect.left < window.innerWidth - 90) return false;
+    return Boolean(button.querySelector("svg.rotate-180, svg"));
+  });
+  if (rightEdgeToggle instanceof HTMLElement) return rightEdgeToggle;
+
   return buttons.find((button) => {
     if (!(button instanceof HTMLElement)) return false;
-    if (button.getAttribute("aria-label") !== "Open") return false;
-    const text = compactText(button.textContent || "");
-    if (text) return false;
+    const label = button.getAttribute("aria-label") || "";
+    if (!/open side panel|show side panel|expand panel/i.test(label)) return false;
     const rect = button.getBoundingClientRect();
-    return rect.width > 0 && rect.height > 0 && rect.left > window.innerWidth * 0.45;
+    return rect.width > 0 && rect.height > 0;
   }) || null;
 }
 
