@@ -55,6 +55,7 @@ const ANNOTATION_COLORS = [
   { border: "#ec4899", rgb: "236, 72, 153" },
   { border: "#a78bfa", rgb: "167, 139, 250" },
 ];
+const ANNOTATION_BOX_PADDING_PX = 4;
 const ANNOTATION_CURSOR_SVG =
   '<svg width="26" height="25" viewBox="0 0 26 25" fill="none" xmlns="http://www.w3.org/2000/svg">' +
   '<path d="M12.6504 0.824799C6.21496 0.824799 0.825466 5.77554 0.825195 12.0885C0.825245 14.2375 1.46183 16.2421 2.55176 17.943L2.02148 20.235L1.99316 20.3756C1.77603 21.655 2.78945 22.7791 4.02832 22.7691L4.0791 22.8209L4.53418 22.7047L7.12305 22.0426C8.77593 22.8778 10.6577 23.3531 12.6504 23.3531C19.086 23.3531 24.4754 18.4014 24.4756 12.0885C24.4753 5.77554 19.0858 0.824799 12.6504 0.824799Z" fill="#0285FF" stroke="white" stroke-width="1.65"/>' +
@@ -3216,7 +3217,6 @@ function renderAnnotationTargets(panel) {
   clearAnnotationTargets(panel);
 
   const mirrorRect = mirror.getBoundingClientRect();
-  const stageRect = stage.getBoundingClientRect();
   if (mirrorRect.width <= 0 || mirrorRect.height <= 0) return;
 
   const meta = panel.__codexppIosSimMeta || {};
@@ -3232,18 +3232,16 @@ function renderAnnotationTargets(panel) {
   let replacementHoverItem = null;
 
   for (const item of renderItems.slice(0, 260)) {
+    const rect = getAnnotationItemOverlayRect(panel, item);
+    if (!rect) continue;
     const target = document.createElement("button");
     target.type = "button";
     target.setAttribute(TWEAK_ATTR, "annotation-target");
     target.setAttribute("aria-label", annotationLabel(item));
-    const left = mirrorRect.left - stageRect.left + (item.frame.x / pointWidth) * mirrorRect.width;
-    const top = mirrorRect.top - stageRect.top + (item.frame.y / pointHeight) * mirrorRect.height;
-    const width = Math.max(8, (item.frame.width / pointWidth) * mirrorRect.width);
-    const height = Math.max(8, (item.frame.height / pointHeight) * mirrorRect.height);
-    target.style.left = `${left}px`;
-    target.style.top = `${top}px`;
-    target.style.width = `${width}px`;
-    target.style.height = `${height}px`;
+    target.style.left = `${rect.left}px`;
+    target.style.top = `${rect.top}px`;
+    target.style.width = `${rect.width}px`;
+    target.style.height = `${rect.height}px`;
     target.style.zIndex = String(annotationTargetZIndex(item));
     target.__codexppIosSimAnnotationItem = item;
     target.addEventListener("pointerenter", (event) => showAnnotationHover(panel, target, item, event));
@@ -3454,11 +3452,50 @@ function getAnnotationItemOverlayRect(panel, item) {
   const overlayRect = overlay.getBoundingClientRect();
   if (mirrorRect.width <= 0 || mirrorRect.height <= 0) return null;
   const dims = getAnnotationDims(panel);
-  return {
+  return padAnnotationOverlayRect({
     left: mirrorRect.left - overlayRect.left + (frame.x / dims.pointWidth) * mirrorRect.width,
     top: mirrorRect.top - overlayRect.top + (frame.y / dims.pointHeight) * mirrorRect.height,
     width: Math.max(8, (frame.width / dims.pointWidth) * mirrorRect.width),
     height: Math.max(8, (frame.height / dims.pointHeight) * mirrorRect.height),
+  }, overlay);
+}
+
+function padAnnotationOverlayRect(rect, overlay) {
+  const padding = ANNOTATION_BOX_PADDING_PX;
+  const overlayRect = overlay?.getBoundingClientRect?.();
+  const maxWidth = Number(overlayRect?.width || 0);
+  const maxHeight = Number(overlayRect?.height || 0);
+  const minSize = 8;
+  let left = rect.left - padding;
+  let top = rect.top - padding;
+  let right = rect.left + rect.width + padding;
+  let bottom = rect.top + rect.height + padding;
+
+  if (maxWidth > 0) {
+    left = Math.max(0, left);
+    right = Math.min(maxWidth, right);
+    if (right - left < minSize) {
+      const center = Math.max(0, Math.min(maxWidth, rect.left + rect.width / 2));
+      left = Math.max(0, Math.min(maxWidth - minSize, center - minSize / 2));
+      right = Math.min(maxWidth, left + minSize);
+    }
+  }
+
+  if (maxHeight > 0) {
+    top = Math.max(0, top);
+    bottom = Math.min(maxHeight, bottom);
+    if (bottom - top < minSize) {
+      const center = Math.max(0, Math.min(maxHeight, rect.top + rect.height / 2));
+      top = Math.max(0, Math.min(maxHeight - minSize, center - minSize / 2));
+      bottom = Math.min(maxHeight, top + minSize);
+    }
+  }
+
+  return {
+    left,
+    top,
+    width: Math.max(minSize, right - left),
+    height: Math.max(minSize, bottom - top),
   };
 }
 
