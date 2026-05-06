@@ -1,7 +1,7 @@
 {
   "id": "co.bennett.ios-simulator",
   "name": "iOS Simulator",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "githubRepo": "b-nnett/codex-plusplus-ios-simulator",
   "description": "Adds an iOS Simulator tab to Codex's right panel. Mirrors the booted simulator headlessly via CoreSimulator IOSurface and forwards taps/swipes through SimulatorKit's HID client.",
   "author": {

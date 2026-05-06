@@ -17,11 +17,20 @@
 
 const TWEAK_ATTR = "data-codexpp-ios-sim";
 const STYLE_ID = "codexpp-ios-sim-style";
+const RENDERER_STATE_KEY = "__codexpp_ios_sim_renderer_state__";
 const MENU_LABEL = "iOS Simulator";
 const PANEL_LABEL = "iOS Simulator";
 const BROWSER_PATTERNS = [/^browser$/i, /^browser use$/i, /\bbrowser\b/i];
+const MENU_ANCHOR_PATTERNS = [
+  ...BROWSER_PATTERNS,
+  /^open file\b/i,
+  /^new chat\b/i,
+  /^browse files\b/i,
+];
 const PICKER_TITLE_PATTERNS = [/^new chat$/i, /^open file$/i, /^browse files$/i];
 const PICKER_SUBTITLE = "Mirror the iOS Simulator in this pane";
+const DEFAULT_AUTO_BOOT = true;
+const OPEN_SHORTCUT_LABEL = "⌘Y";
 
 const PHONE_SVG =
   '<svg width="16" height="16" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg" class="h-4 w-4 rounded-2xs">' +
@@ -70,16 +79,38 @@ module.exports = {
       return;
     }
 
+    globalThis[RENDERER_STATE_KEY]?.dispose?.();
+
+    const rendererState = {
+      api,
+      cleanup: [],
+      observer: null,
+      panelOpen: false,
+      pageHandle: null,
+      disposed: false,
+      dispose: () => disposeRendererState(rendererState),
+    };
+    globalThis[RENDERER_STATE_KEY] = rendererState;
+    this._rendererState = rendererState;
+    this.cleanup = rendererState.cleanup;
+
     injectStyles();
-    this.cleanup.push(() => document.getElementById(STYLE_ID)?.remove());
-    this.cleanup.push(() => removeSimPanel());
+    rendererState.cleanup.push(() => document.getElementById(STYLE_ID)?.remove());
+    rendererState.cleanup.push(() => removeSimPanel());
+    registerSettingsPage(rendererState);
 
     await api.react.waitForElement?.("body", 10_000);
 
-    this.observer = new MutationObserver(() => this.installMenuEntries());
-    this.observer.observe(document.body, { childList: true, subtree: true });
-    this.cleanup.push(() => this.observer?.disconnect());
+    rendererState.observer = new MutationObserver(() => {
+      this.installMenuEntries();
+      if (rendererState.panelOpen) {
+        scheduleOpenPanelReconcile(rendererState);
+      }
+    });
+    rendererState.observer.observe(document.body, { childList: true, subtree: true });
+    rendererState.cleanup.push(() => rendererState.observer?.disconnect());
 
+    installOpenShortcut(rendererState);
     this.installMenuEntries();
   },
 
@@ -95,14 +126,17 @@ module.exports = {
     this.cleanup = [];
     document.querySelectorAll(`[${TWEAK_ATTR}]`).forEach((node) => node.remove());
     removeSimPanel();
+    if (globalThis[RENDERER_STATE_KEY] === this._rendererState) {
+      delete globalThis[RENDERER_STATE_KEY];
+    }
   },
 
   installMenuEntries() {
-    for (const browserButton of findBrowserMenuButtons()) {
-      if (browserButton.nextElementSibling?.getAttribute(TWEAK_ATTR) === "menu-entry") {
+    for (const anchorButton of findMenuAnchorButtons()) {
+      if (menuScopeHasSimEntry(anchorButton)) {
         continue;
       }
-      const simButton = browserButton.cloneNode(true);
+      const simButton = anchorButton.cloneNode(true);
       simButton.setAttribute(TWEAK_ATTR, "menu-entry");
       simButton.setAttribute("aria-label", MENU_LABEL);
       rewriteMenuEntry(simButton);
@@ -116,7 +150,7 @@ module.exports = {
         const now = Date.now();
         if (simButton.__codexppLastActivate && now - simButton.__codexppLastActivate < 400) return;
         simButton.__codexppLastActivate = now;
-        closeTransientMenu(browserButton);
+        closeTransientMenu(anchorButton);
         this.api?.log?.info?.("opening iOS Simulator side panel");
         openSimPanel(this.api);
       };
@@ -124,10 +158,173 @@ module.exports = {
       simButton.addEventListener("pointerdown", activate, true);
       simButton.addEventListener("mousedown", activate, true);
       simButton.addEventListener("click", activate, true);
-      browserButton.insertAdjacentElement("afterend", simButton);
+      anchorButton.insertAdjacentElement("afterend", simButton);
     }
   },
 };
+
+function disposeRendererState(state) {
+  if (!state || state.disposed) return;
+  state.disposed = true;
+  for (const dispose of state.cleanup.splice(0).reverse()) {
+    try {
+      dispose();
+    } catch {}
+  }
+  state.pageHandle?.unregister?.();
+  state.pageHandle = null;
+  document.querySelectorAll(`[${TWEAK_ATTR}]`).forEach((node) => node.remove());
+  removeSimPanel();
+}
+
+function currentRendererState() {
+  return globalThis[RENDERER_STATE_KEY] || null;
+}
+
+function setPanelOpen(value) {
+  const state = currentRendererState();
+  if (state) state.panelOpen = Boolean(value);
+}
+
+function scheduleOpenPanelReconcile(state) {
+  if (state.__reconcileTimer) return;
+  state.__reconcileTimer = window.setTimeout(() => {
+    state.__reconcileTimer = null;
+    if (state.disposed || !state.panelOpen) return;
+    if (isSimPanelMounted()) return;
+    try {
+      mountSimPanel(state.api);
+    } catch (error) {
+      state.api?.log?.warn?.("ios-sim reconcile failed", String(error?.stack || error));
+    }
+  }, 50);
+}
+
+function isSimPanelMounted() {
+  const tab = document.querySelector(`[${TWEAK_ATTR}="side-tab"]`);
+  const panel = document.querySelector(`[${TWEAK_ATTR}="tabpanel"]`);
+  return tab instanceof HTMLElement && tab.isConnected && panel instanceof HTMLElement && panel.isConnected;
+}
+
+function registerSettingsPage(state) {
+  const api = state?.api;
+  if (typeof api?.settings?.registerPage !== "function") return;
+  state.pageHandle = api.settings.registerPage({
+    id: "main",
+    title: "iOS Simulator",
+    description: "Right-panel simulator mirroring and boot behavior.",
+    iconSvg:
+      '<svg width="20" height="20" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg" class="icon-sm inline-block align-middle" aria-hidden="true">' +
+      '<rect x="5.75" y="2.75" width="8.5" height="14.5" rx="2" stroke="currentColor" stroke-width="1.5"/>' +
+      '<path d="M8.75 5h2.5" stroke="currentColor" stroke-width="1.25" stroke-linecap="round"/>' +
+      '<path d="M9 15h2" stroke="currentColor" stroke-width="1.25" stroke-linecap="round"/>' +
+      "</svg>",
+    render(root) {
+      renderSettings(root, state);
+    },
+  });
+  state.cleanup.push(() => {
+    state.pageHandle?.unregister?.();
+    state.pageHandle = null;
+  });
+}
+
+function renderSettings(root, state) {
+  root.textContent = "";
+  const section = settingsEl("section", "flex flex-col gap-2");
+  section.appendChild(settingsTitle("Behavior"));
+
+  const card = settingsEl("div", "rounded-lg border border-token-border-default bg-token-bg-secondary");
+  card.append(
+    settingsRow(
+      "Auto-boot simulator",
+      "Boot a sensible default iPhone when the iOS Simulator panel opens and no device is running.",
+      nativeSwitch("Auto-boot simulator", readAutoBootEnabled(state.api), (next) => {
+        state.api.storage.set("auto-boot", next);
+      }),
+    ),
+    settingsRow(
+      "Headless capture",
+      "Mirror the booted simulator inside Codex without opening Simulator.app.",
+      settingsBadge("Enabled"),
+    ),
+  );
+
+  section.appendChild(card);
+  root.appendChild(section);
+}
+
+function readAutoBootEnabled(api) {
+  const value = api?.storage?.get?.("auto-boot");
+  return typeof value === "boolean" ? value : DEFAULT_AUTO_BOOT;
+}
+
+function settingsTitle(text) {
+  const node = settingsEl("div", "text-token-text-secondary px-1 text-xs font-semibold uppercase tracking-wide");
+  node.textContent = text;
+  return node;
+}
+
+function settingsRow(title, description, control) {
+  const row = settingsEl("div", "flex items-center justify-between gap-4 p-3");
+  const left = settingsEl("div", "flex min-w-0 flex-col gap-1");
+  const label = settingsEl("div", "min-w-0 text-sm text-token-text-primary");
+  label.textContent = title;
+  const desc = settingsEl("div", "text-token-text-secondary min-w-0 text-sm");
+  desc.textContent = description;
+  left.append(label, desc);
+  row.append(left, control);
+  return row;
+}
+
+function nativeSwitch(label, initial, onChange) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.role = "switch";
+  button.setAttribute("aria-label", label);
+  button.className =
+    "inline-flex items-center text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-token-focus-border focus-visible:rounded-full cursor-interaction";
+  const track = document.createElement("span");
+  track.className =
+    "relative inline-flex h-5 w-8 shrink-0 items-center rounded-full transition-colors duration-200 ease-out";
+  const knob = document.createElement("span");
+  knob.className =
+    "inline-block h-4 w-4 rounded-full bg-white shadow-sm transition-transform duration-200 ease-out";
+  track.appendChild(knob);
+
+  let checked = Boolean(initial);
+  const sync = () => {
+    button.setAttribute("aria-checked", checked ? "true" : "false");
+    track.style.background = checked
+      ? "var(--color-token-bg-primary-inverted, #0A84FF)"
+      : "color-mix(in srgb, currentColor 22%, transparent)";
+    knob.style.transform = checked ? "translateX(12px)" : "translateX(2px)";
+  };
+
+  button.appendChild(track);
+  button.addEventListener("click", () => {
+    checked = !checked;
+    sync();
+    onChange?.(checked);
+  });
+  sync();
+  return button;
+}
+
+function settingsBadge(text) {
+  const badge = settingsEl(
+    "span",
+    "shrink-0 rounded-full border border-token-border-default px-2 py-0.5 text-xs text-token-text-secondary",
+  );
+  badge.textContent = text;
+  return badge;
+}
+
+function settingsEl(tag, className) {
+  const node = document.createElement(tag);
+  if (className) node.className = className;
+  return node;
+}
 
 // ── main process ────────────────────────────────────────────────────────
 
@@ -142,6 +339,7 @@ function registerMainHandlers(api, tweak) {
   const { ipcMain, webContents } = electron;
   const fs = require("node:fs");
   const path = require("node:path");
+  const os = require("node:os");
   const id = api.manifest?.id || "co.bennett.ios-simulator";
   const ch = (name) => `codexpp:${id}:${name}`;
   const channels = [
@@ -165,9 +363,20 @@ function registerMainHandlers(api, tweak) {
   }
 
   // Capture state ------------------------------------------------------
-  const helperDir = path.join(__dirname, "helpers");
-  const swiftSrc = path.join(helperDir, "sim-capture.swift");
-  const helperBin = path.join(helperDir, "sim-capture");
+  const helperSourceDir = path.join(__dirname, "helpers");
+  const helperBuildDir = path.join(
+    os.homedir(),
+    "Library",
+    "Caches",
+    id,
+    "helpers",
+  );
+  try {
+    fs.mkdirSync(helperBuildDir, { recursive: true });
+  } catch {}
+
+  const swiftSrc = path.join(helperSourceDir, "sim-capture.swift");
+  const helperBin = path.join(helperBuildDir, "sim-capture");
   const FRAME_CHANNEL = ch("ios-sim:capture:frame");
   const META_CHANNEL = ch("ios-sim:capture:meta");
   const STATUS_CHANNEL = ch("ios-sim:capture:status");
@@ -314,8 +523,8 @@ function registerMainHandlers(api, tweak) {
   }
 
   // Input helper -------------------------------------------------------
-  const inputSrc = path.join(helperDir, "sim-input.m");
-  const inputBin = path.join(helperDir, "sim-input");
+  const inputSrc = path.join(helperSourceDir, "sim-input.m");
+  const inputBin = path.join(helperBuildDir, "sim-input");
 
   const input = (globalThis.__codexppIosSimInput = globalThis.__codexppIosSimInput || {
     proc: null,
@@ -440,7 +649,6 @@ function registerMainHandlers(api, tweak) {
   // resolve the path against ~/Desktop here so the renderer never has to
   // know HOME (which it can't read on 0.1.x anyway) and can't request
   // writes to arbitrary filesystem locations.
-  const os = require("node:os");
   ipcMain.handle(ch("ios-sim:screenshot"), async (_evt, filename) => {
     const safe = String(filename || "")
       .replace(/[^A-Za-z0-9._-]/g, "_")
@@ -620,10 +828,11 @@ function injectStyles() {
 
 // ── menu detection ──────────────────────────────────────────────────────
 
-function findBrowserMenuButtons() {
+function findMenuAnchorButtons() {
   const found = new Set();
 
-  // Legacy: native Codex menu with a "Browser" entry.
+  // Native Codex menu. Prefer Browser when present, but do not depend on it:
+  // Codex/Better Browser may hide Browser once a tab exists.
   const radixCandidates = Array.from(
     document.querySelectorAll(
       '[role="menuitem"], [role="menu"] button, [data-radix-popper-content-wrapper] button',
@@ -633,10 +842,9 @@ function findBrowserMenuButtons() {
     if (!(node instanceof HTMLElement)) continue;
     if (node.getAttribute(TWEAK_ATTR)) continue;
     if (!isMenuCandidate(node)) continue;
-    if (
-      matchesBrowserText(extractLabel(node)) ||
-      matchesBrowserText(compactText(node.textContent || ""))
-    ) {
+    const label = extractLabel(node);
+    const text = compactText(node.textContent || "");
+    if (matchesMenuAnchorText(label) || matchesMenuAnchorText(text)) {
       found.add(node);
     }
   }
@@ -669,6 +877,13 @@ function findBrowserMenuButtons() {
   return Array.from(found);
 }
 
+function menuScopeHasSimEntry(anchor) {
+  const scope =
+    anchor.closest('[role="menu"], [role="dialog"], [data-radix-popper-content-wrapper]') ||
+    anchor.parentElement;
+  return Boolean(scope?.querySelector?.(`[${TWEAK_ATTR}="menu-entry"]`));
+}
+
 function isMenuCandidate(node) {
   if (node.closest('[role="tablist"], [role="tabpanel"]')) return false;
   if (node.getAttribute("role") === "menuitem") return true;
@@ -683,6 +898,7 @@ function isMenuCandidate(node) {
 function rewriteMenuEntry(button) {
   rewriteMenuLabel(button);
   rewriteMenuIcon(button);
+  installShortcutHint(button);
 }
 
 function rewriteMenuLabel(button) {
@@ -691,12 +907,15 @@ function rewriteMenuLabel(button) {
   for (let node = walker.nextNode(); node; node = walker.nextNode()) {
     textNodes.push(node);
   }
-  // Browser-style entries: replace inline "Browser" → "iOS Simulator".
+  // Browser/open-file-style entries: replace the primary row label.
   for (const node of textNodes) {
-    if (matchesBrowserText(compactText(node.nodeValue || ""))) {
+    if (matchesMenuAnchorText(compactText(node.nodeValue || ""))) {
       node.nodeValue = (node.nodeValue || "")
         .replace(/Browser use/i, MENU_LABEL)
-        .replace(/Browser/i, MENU_LABEL);
+        .replace(/Browser/i, MENU_LABEL)
+        .replace(/Open file/i, MENU_LABEL)
+        .replace(/Browse files/i, MENU_LABEL)
+        .replace(/New chat/i, MENU_LABEL);
       removeShortcutHints(button);
       return;
     }
@@ -747,6 +966,32 @@ function removeShortcutHints(button) {
   }
 }
 
+function installShortcutHint(button) {
+  if (button.closest('[role="dialog"]')) return;
+  if (button.querySelector(`[${TWEAK_ATTR}="shortcut-hint"]`)) return;
+  const hint = document.createElement("span");
+  hint.setAttribute(TWEAK_ATTR, "shortcut-hint");
+  hint.setAttribute("aria-hidden", "true");
+  hint.className = "ml-auto shrink-0 text-xs text-token-text-tertiary";
+  hint.textContent = OPEN_SHORTCUT_LABEL;
+  button.appendChild(hint);
+}
+
+function installOpenShortcut(state) {
+  if (!state?.api) return;
+  const onKeyDown = (event) => {
+    if (event.defaultPrevented || event.repeat || event.isComposing) return;
+    if (!event.metaKey || event.ctrlKey || event.altKey || event.shiftKey) return;
+    if (String(event.key || "").toLowerCase() !== "y") return;
+    event.preventDefault();
+    event.stopPropagation();
+    state.api?.log?.info?.("opening iOS Simulator side panel via shortcut");
+    openSimPanel(state.api);
+  };
+  document.addEventListener("keydown", onKeyDown, true);
+  state.cleanup.push(() => document.removeEventListener("keydown", onKeyDown, true));
+}
+
 function closeTransientMenu(origin) {
   const menuRoot =
     origin.closest('[role="menu"]') ||
@@ -762,9 +1007,14 @@ function closeTransientMenu(origin) {
 // ── side panel ──────────────────────────────────────────────────────────
 
 function openSimPanel(api) {
+  setPanelOpen(true);
   ensureSidePanelVisible();
   // NOTE: requestAnimationFrame is paused when the window is unfocused, which
   // prevented mounting when the user tabbed away. setTimeout fires regardless.
+  mountSimPanelSoon(api, 30);
+}
+
+function mountSimPanelSoon(api, attemptsLeft) {
   setTimeout(() => {
     let mounted = false;
     try {
@@ -772,8 +1022,14 @@ function openSimPanel(api) {
     } catch (err) {
       api?.log?.error?.("ios-sim mountSimPanel threw", String(err?.stack || err));
     }
-    if (!mounted) api?.log?.warn?.("ios-sim could not find side panel host");
-  }, 16);
+    if (mounted) return;
+    if (attemptsLeft > 1) {
+      ensureSidePanelVisible();
+      mountSimPanelSoon(api, attemptsLeft - 1);
+      return;
+    }
+    api?.log?.warn?.("ios-sim could not find side panel host");
+  }, attemptsLeft === 30 ? 16 : 100);
 }
 
 function mountSimPanel(api) {
@@ -788,7 +1044,7 @@ function mountSimPanel(api) {
   let panel = document.querySelector(`[${TWEAK_ATTR}="tabpanel"]`);
 
   if (!tab) {
-    tab = createSideTab();
+    tab = createSideTab(tablist);
     tablist.appendChild(tab);
   }
   if (!panel) {
@@ -800,7 +1056,193 @@ function mountSimPanel(api) {
   return true;
 }
 
-function createSideTab() {
+function createSideTab(tablist) {
+  const nativeTab = findNativeTabTemplate(tablist);
+  if (nativeTab) {
+    const cloned = nativeTab.cloneNode(true);
+    hydrateClonedSideTab(cloned);
+    wireSideTab(cloned);
+    return cloned;
+  }
+
+  return createFallbackSideTab();
+}
+
+function findNativeTabTemplate(tablist) {
+  if (!(tablist instanceof HTMLElement)) return null;
+  const tabs = Array.from(
+    tablist.querySelectorAll('[data-app-shell-tab-controller="right"][data-tab-id]'),
+  );
+  return tabs.find((node) => {
+    if (!(node instanceof HTMLElement)) return false;
+    if (node.getAttribute(TWEAK_ATTR) === "side-tab") return false;
+    const id = node.getAttribute("data-tab-id") || "";
+    return id !== "ios-simulator";
+  }) || null;
+}
+
+function hydrateClonedSideTab(controller) {
+  controller.setAttribute(TWEAK_ATTR, "side-tab");
+  controller.setAttribute("data-app-shell-tab-controller", "right");
+  controller.setAttribute("data-tab-id", "ios-simulator");
+  controller.removeAttribute("data-selected");
+  controller.removeAttribute("aria-selected");
+  delete controller.dataset.codexppDragging;
+  controller.style.opacity = "";
+  controller.draggable = true;
+
+  for (const node of controller.querySelectorAll("[id], [aria-controls]")) {
+    node.removeAttribute("id");
+    node.removeAttribute("aria-controls");
+  }
+  for (const node of controller.querySelectorAll("[data-tab-id]")) {
+    node.setAttribute("data-tab-id", "ios-simulator");
+  }
+  for (const node of controller.querySelectorAll("[data-state]")) {
+    node.removeAttribute("data-state");
+  }
+  for (const bg of controller.querySelectorAll(".bg-\\[var\\(--app-shell-tab-background\\)\\]")) {
+    bg.classList.remove("bg-[var(--app-shell-tab-background)]");
+  }
+
+  removeClonedCloseControls(controller);
+
+  let tabButton = controller.querySelector('button[role="tab"]');
+  if (!(tabButton instanceof HTMLButtonElement)) {
+    tabButton = controller.querySelector("[role='tab']");
+  }
+  if (!(tabButton instanceof HTMLElement)) {
+    tabButton = document.createElement("button");
+    tabButton.type = "button";
+    tabButton.setAttribute("role", "tab");
+    tabButton.className =
+      "no-drag relative flex flex-1 items-center gap-2 z-10 text-sm min-w-0 overflow-hidden text-token-text-secondary";
+    controller.appendChild(tabButton);
+  }
+
+  if (tabButton instanceof HTMLButtonElement) tabButton.type = "button";
+  tabButton.setAttribute("role", "tab");
+  tabButton.setAttribute("aria-selected", "false");
+  tabButton.setAttribute("aria-label", PANEL_LABEL);
+  tabButton.classList.remove("text-token-text-primary");
+  tabButton.classList.add("text-token-text-secondary");
+
+  rewriteSideTabIcon(tabButton);
+  rewriteSideTabLabel(tabButton);
+  installCloseControl(tabButton);
+
+  let sep = controller.querySelector('[data-app-shell-tab-separator]');
+  if (!(sep instanceof HTMLElement)) {
+    sep = document.createElement("div");
+    sep.setAttribute("aria-hidden", "true");
+    sep.className =
+      "h-3 w-px shrink-0 end-0 absolute bg-token-border transition-opacity duration-200 opacity-0";
+    controller.appendChild(sep);
+  }
+  sep.setAttribute("data-app-shell-tab-separator", "ios-simulator");
+}
+
+function removeClonedCloseControls(controller) {
+  for (const node of Array.from(
+    controller.querySelectorAll('button[aria-label], [role="button"][aria-label], [data-app-shell-tab-close]'),
+  )) {
+    if (!(node instanceof HTMLElement)) continue;
+    if (node.getAttribute("role") === "tab") continue;
+    if (/close/i.test(node.getAttribute("aria-label") || "") || node.hasAttribute("data-app-shell-tab-close")) {
+      node.remove();
+    }
+  }
+}
+
+function rewriteSideTabIcon(tabButton) {
+  const iconSlot =
+    tabButton.querySelector('span[aria-hidden="true"]') ||
+    tabButton.querySelector(".icon-xs") ||
+    tabButton.querySelector("svg")?.parentElement;
+  if (iconSlot instanceof HTMLElement) {
+    if (/^(svg|img)$/i.test(iconSlot.tagName)) {
+      const span = htmlToElement(PHONE_ICON);
+      span.className = "icon-xs flex shrink-0 items-center justify-center group-hover/tab:invisible";
+      iconSlot.replaceWith(span);
+      return;
+    }
+    iconSlot.setAttribute("aria-hidden", "true");
+    iconSlot.className =
+      "icon-xs flex shrink-0 items-center justify-center group-hover/tab:invisible";
+    iconSlot.innerHTML = PHONE_SVG;
+    return;
+  }
+  tabButton.prepend(htmlToElement(PHONE_ICON));
+}
+
+function rewriteSideTabLabel(tabButton) {
+  const walker = document.createTreeWalker(tabButton, NodeFilter.SHOW_TEXT);
+  const textNodes = [];
+  for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+    if (compactText(node.nodeValue || "")) textNodes.push(node);
+  }
+  if (textNodes.length > 0) {
+    textNodes[0].nodeValue = MENU_LABEL;
+    for (const node of textNodes.slice(1)) node.nodeValue = "";
+    return;
+  }
+  const labelSpan = document.createElement("span");
+  labelSpan.className = "inline-block min-w-0 whitespace-nowrap";
+  labelSpan.textContent = MENU_LABEL;
+  tabButton.appendChild(labelSpan);
+}
+
+function installCloseControl(tabButton) {
+  let close = tabButton.querySelector(`[${TWEAK_ATTR}="close-tab"]`);
+  if (!(close instanceof HTMLElement)) {
+    close = document.createElement("div");
+    close.setAttribute(TWEAK_ATTR, "close-tab");
+    close.className =
+      "no-drag shrink-0 cursor-interaction items-center justify-center group-hover/tab:flex after:content-[''] after:absolute after:-inset-2 hidden absolute start-1 z-30 size-5 top-1/2 -translate-y-1/2 text-token-text-tertiary hover:text-token-text-primary";
+    tabButton.appendChild(close);
+  }
+  close.setAttribute("role", "button");
+  close.setAttribute("aria-label", `Close ${MENU_LABEL} tab`);
+  close.innerHTML = SVGS.close;
+  close.addEventListener("mousedown", (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+  });
+  close.addEventListener("click", (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    closeSimTab();
+  });
+}
+
+function wireSideTab(controller) {
+  const tabButton = controller.querySelector('[role="tab"]') || controller;
+  tabButton.addEventListener("click", () => {
+    const panelHost = controller.closest(".flex.h-full.min-h-0.flex-col");
+    const panel = document.querySelector(`[${TWEAK_ATTR}="tabpanel"]`);
+    if (panelHost instanceof HTMLElement && panel instanceof HTMLElement) {
+      activateSimPanel(panelHost, controller, panel);
+    }
+  });
+
+  controller.addEventListener("dragstart", (e) => {
+    if (!e.dataTransfer) return;
+    if ((e.target instanceof Element) && e.target.closest(`[${TWEAK_ATTR}="close-tab"]`)) {
+      e.preventDefault();
+      return;
+    }
+    e.dataTransfer.effectAllowed = "move";
+    try { e.dataTransfer.setData("text/x-codexpp-ios-sim", "1"); } catch {}
+    controller.dataset.codexppDragging = "1";
+    controller.style.opacity = "0.4";
+  });
+  controller.addEventListener("dragend", () => {
+    delete controller.dataset.codexppDragging;
+    controller.style.opacity = "";
+  });
+}
+
+function createFallbackSideTab() {
   const controller = document.createElement("div");
   controller.setAttribute(TWEAK_ATTR, "side-tab");
   controller.setAttribute("data-app-shell-tab-controller", "right");
@@ -812,7 +1254,7 @@ function createSideTab() {
   shell.setAttribute("data-tab-id", "ios-simulator");
   shell.setAttribute("aria-roledescription", "sortable");
   shell.className =
-    "group/tab relative flex max-w-39 shrink-0 items-center overflow-hidden rounded-md bg-token-main-surface-primary px-2 py-1";
+    "group/tab relative flex h-7 max-w-39 shrink-0 items-center overflow-hidden rounded-lg bg-token-main-surface-primary px-2 py-1";
   shell.setAttribute("role", "button");
   shell.tabIndex = 0;
   shell.style.setProperty(
@@ -903,6 +1345,7 @@ function createSideTab() {
 }
 
 function closeSimTab() {
+  setPanelOpen(false);
   const panelHost = findRightTablist()?.closest(".flex.h-full.min-h-0.flex-col");
   if (panelHost instanceof HTMLElement) deactivateSimPanel(panelHost);
   document.querySelector(`[${TWEAK_ATTR}="side-tab"]`)?.remove();
@@ -1247,6 +1690,9 @@ function activateSimPanel(panelHost, tab, panel) {
       } catch (e) {
         console.warn("ios-sim attach capture", e);
       }
+      if (!readAutoBootEnabled(api)) {
+        return refreshDeviceLabel(panel, api);
+      }
       return ensureBootedDevice(panel, api).then(() => refreshDeviceLabel(panel, api));
     })
     .catch((e) => {
@@ -1258,6 +1704,7 @@ function activateSimPanel(panelHost, tab, panel) {
 }
 
 function deactivateSimPanel(panelHost) {
+  setPanelOpen(false);
   const tabWrap = document.querySelector(`[${TWEAK_ATTR}="side-tab"]`);
   const tab = tabWrap?.querySelector('[role="tab"]');
   const panel = document.querySelector(`[${TWEAK_ATTR}="tabpanel"]`);
@@ -1287,6 +1734,7 @@ function deactivateSimPanel(panelHost) {
 }
 
 function removeSimPanel() {
+  setPanelOpen(false);
   const panelHost = findRightTablist()?.closest(".flex.h-full.min-h-0.flex-col");
   if (panelHost instanceof HTMLElement) deactivateSimPanel(panelHost);
   document.querySelector(`[${TWEAK_ATTR}="side-tab"]`)?.remove();
@@ -1295,17 +1743,38 @@ function removeSimPanel() {
 
 function ensureSidePanelVisible() {
   if (findRightTablist()) return;
-  const toggle = document.querySelector(
-    'button[aria-label="Toggle side panel"][aria-pressed="false"]',
-  );
+  const toggle =
+    document.querySelector('button[aria-label="Toggle side panel"][aria-pressed="false"]') ||
+    document.querySelector('button[aria-label="Open side panel"]') ||
+    findLikelySidePanelOpenButton();
   if (toggle instanceof HTMLElement) toggle.click();
 }
 
+function findLikelySidePanelOpenButton() {
+  const buttons = Array.from(document.querySelectorAll("button[aria-label]"));
+  return buttons.find((button) => {
+    if (!(button instanceof HTMLElement)) return false;
+    if (button.getAttribute("aria-label") !== "Open") return false;
+    const text = compactText(button.textContent || "");
+    if (text) return false;
+    const rect = button.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0 && rect.left > window.innerWidth * 0.45;
+  }) || null;
+}
+
 function findRightTablist() {
-  const addButton = document.querySelector(
-    'button[aria-label="Open side panel tab"]',
-  );
-  const toolbar = addButton?.closest(".flex.h-toolbar-pane");
+  const rightPanel = document.querySelector('[data-app-shell-focus-area="right-panel"]');
+  const rightPanelTablist = rightPanel?.querySelector?.('[role="tablist"]');
+  if (rightPanelTablist instanceof HTMLElement) return rightPanelTablist;
+
+  const rightTab = document.querySelector('[data-app-shell-tab-controller="right"][data-tab-id]');
+  const owningTablist = rightTab?.closest?.('[role="tablist"]');
+  if (owningTablist instanceof HTMLElement) return owningTablist;
+
+  const addButton =
+    document.querySelector('button[aria-label="Open side panel tab"]') ||
+    document.querySelector('button[title="Open side panel tab"]');
+  const toolbar = addButton?.closest(".flex.h-toolbar-pane, .h-toolbar, .box-content");
   return toolbar?.querySelector('[role="tablist"]') || null;
 }
 
@@ -1647,6 +2116,10 @@ function extractLabel(node) {
 
 function matchesBrowserText(value) {
   return BROWSER_PATTERNS.some((pattern) => pattern.test(value));
+}
+
+function matchesMenuAnchorText(value) {
+  return MENU_ANCHOR_PATTERNS.some((pattern) => pattern.test(value));
 }
 
 function compactText(value) {
