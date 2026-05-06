@@ -3593,11 +3593,12 @@ async function openNativeAnnotationComment(panel, item, comment) {
   const conversationId = findActiveConversationId(panel);
   const simulatorId = getAnnotationSimulatorId(panel);
   const body = comment.trim();
+  const id = `ios-sim-annotation-${Date.now()}-${Math.random().toString(36).slice(2)}`;
   const payload = {
-    id: `ios-sim-annotation-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+    id,
     conversationId,
     body,
-    comment: createIosSimulatorCommentAttachment(panel, item, body, simulatorId),
+    comment: createIosSimulatorCommentAttachment(panel, item, body, simulatorId, id),
   };
   const res = await submitSavedAnnotationToComposer(payload);
   if (res?.ok) return true;
@@ -3663,17 +3664,26 @@ function createIosSimulatorAnnotationAnchor(item, simulatorId) {
   };
 }
 
-function createIosSimulatorCommentAttachment(panel, item, body, simulatorId) {
+function createIosSimulatorCommentAttachment(panel, item, body, simulatorId, commentId) {
   const frame = normalizeAxFrame(item.frame) || { x: 0, y: 0, width: 0, height: 0 };
   const label = annotationLabel(item);
   const pathId = simulatorId || "booted";
   const viewportSize = getAnnotationViewportSize(panel);
+  const markerViewportPoint = {
+    x: frame.x + frame.width / 2,
+    y: frame.y + frame.height / 2,
+  };
   return {
+    id: commentId,
+    type: "comment",
+    origin: "browser",
+    body,
     position: {
+      side: "right",
       path: `browser:ios-simulator:${pathId}`,
       line: 1,
     },
-    content: [{ type: "text", text: body, text_elements: [] }],
+    content: [{ content_type: "text", text: body }],
     localBrowserContext: {
       pageUrl: `ios-simulator://${pathId}`,
       framePath: ["iOS Simulator"],
@@ -3688,13 +3698,12 @@ function createIosSimulatorCommentAttachment(panel, item, body, simulatorId) {
     },
     localBrowserCommentMetadata: {
       kind: "element",
-      markerViewportPoint: {
-        x: frame.x + frame.width / 2,
-        y: frame.y + frame.height / 2,
-      },
+      markerViewportPoint,
       viewportSize,
     },
+    markerViewportPoint,
     localBrowserAttachedImages: [],
+    attachedImages: [],
   };
 }
 
