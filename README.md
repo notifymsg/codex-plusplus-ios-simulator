@@ -1,100 +1,82 @@
 # iOS Simulator for Codex++
 
-Adds an **iOS Simulator** entry to Codex's right-panel `+` menu, alongside
-`Open file` and `Browser`. Selecting it opens a real-feeling tab that
-mirrors the booted iOS simulator **headlessly** (no `Simulator.app`
-window) and forwards taps, swipes, and hardware buttons back to the
-device.
+A Codex++ tweak that adds an **iOS Simulator** tab to Codex's right panel.
 
-This is a [Codex++](https://github.com/b-nnett/codex-plusplus) tweak —
-install Codex++ first, then drop this directory into
-`~/Library/Application Support/codex-plusplus/tweaks/`.
+It mirrors a booted iOS simulator without opening `Simulator.app`, forwards
+touch and keyboard input, and lets you annotate simulator UI elements directly
+into Codex comments.
 
-## Requirements
+## Install
 
-- macOS with **Xcode** installed (Command-Line Tools alone aren't enough
-  — the tweak needs `SimulatorKit.framework`, which only ships with the
-  full Xcode).
-- `sudo xcode-select -s /Applications/Xcode.app` if you've previously
-  pointed the toolchain at the CLT.
-- At least one downloaded iOS runtime / simulator device.
+Install [Codex++](https://github.com/b-nnett/codex-plusplus), then place this
+folder in:
 
-The tweak runs a preflight check on first open and surfaces a one-line
-error with a fix-it hint if any of the above is missing.
+```text
+~/Library/Application Support/codex-plusplus/tweaks/
+```
 
-## How it works
+Requirements:
 
-- **UI.** A `MutationObserver` clones the existing `+` menu entry into
-  an "iOS Simulator" item, then mounts a sibling tab + tabpanel into
-  Codex's right-panel shell. The tab now clones the live right-panel tab
-  markup before rewriting the icon, title, close action, and tab id, so
-  it stays visually aligned with modern Codex++ extensions such as
-  Better Browser and File Editor instead of relying on stale hand-built
-  class strings. A fallback tab renderer is kept for older Codex builds.
-- **Settings.** The tweak registers a Codex++ settings page with the same
-  card/switch pattern used by newer tweaks. The current control lets you
-  decide whether opening the panel should automatically boot a default
-  iPhone when no simulator is already running.
-- **Capture.** A small Swift helper
-  (`helpers/sim-capture.swift`) attaches to `CoreSimulator`'s
-  `SimDisplayIOSurfaceRenderable` and JPEG-encodes frames straight from
-  the device's IOSurface. The compiled helper binary is cached under
-  `~/Library/Caches/co.bennett.ios-simulator/` rather than inside the
-  Codex++ support tree, so first-open compilation does not wake Codex++'s
-  tweak watcher and reload the panel. Frames are
-  length-prefixed on stdout and forwarded to the renderer over IPC at
-  native pixel resolution (e.g. 1170×2532 for an iPhone 16e).
-- **Input.** An Objective-C helper (`helpers/sim-input.m`) ports
-  `FBSimulatorIndigoHID`: it builds Indigo binary structs for touch /
-  keyboard / hardware-button events and posts them via
-  `SimDeviceLegacyHIDClient` over a mach port. Its compiled binary uses
-  the same external helper cache as capture. Pointer events on the mirror
-  surface are scaled CSS px → device point → device pixel before being
-  forwarded.
-- **Device picker.** Toolbar lists every installed simulator with a
-  `● Booted` indicator. Selecting another device shuts the current one
-  down, boots the new one, and restarts the capture stream.
+- macOS with full **Xcode** installed.
+- `sudo xcode-select -s /Applications/Xcode.app` if your machine points at the
+  Command Line Tools.
+- At least one downloaded iOS simulator runtime/device.
 
-## Why a parallel tab?
+The tweak runs a preflight check the first time you open it and shows a short
+fix hint if something is missing.
 
-Codex's right-panel tab system is React-internal in a 2.8 MB minified
-Vite bundle whose chunk hashes rotate every release. Patching the
-bundle to add a real tab type would break on every Codex update. The
-parallel injection is robust across releases. The current implementation
-uses Codex's own mounted tab DOM as a template, which gives us the top-bar
-shape, spacing, drag affordance, selected state, and hover treatment from
-the app itself while keeping the simulator panel independent from the
-minified bundle internals.
+## Open
 
-## Permissions
+Use the right-panel `+` menu and choose **iOS Simulator**. The row appears below
+the divider, next to Codex's other panel tools.
 
-- **Screen Recording** is **not** required — capture goes through
-  `CoreSimulator` IOSurface, not display capture.
-- The first run compiles the helpers via `swiftc` / `clang` from your
-  Xcode install into `~/Library/Caches/co.bennett.ios-simulator/`.
-  Subsequent runs reuse the cached binaries.
+You can also use `Cmd+Y`.
 
-## Security model
+## Features
 
-- All long-running native processes are spawned by the tweak's main
-  process and killed on `stop()`.
-- The `simctl` IPC channel only accepts a small whitelist of
-  subcommands (`boot`, `shutdown`) and validates UDIDs against a
-  regex. Screenshots go through a dedicated handler that resolves the
-  destination path against `~/Desktop` server-side; the renderer
-  cannot request writes to arbitrary filesystem locations.
-- Helpers are signed with the user's local toolchain; nothing is
-  fetched from the network.
+- Native Codex right-panel tab and panel.
+- Headless simulator mirroring through CoreSimulator IOSurface.
+- Tap, drag, swipe, keyboard, Home, Lock, Side Button, Siri, and screenshot
+  controls.
+- Device picker for switching between installed simulators.
+- Optional auto-boot when no simulator is running.
+- Local helper binaries compiled from source on first use.
+
+## Annotations
+
+Annotation mode helps you point an agent at a specific part of the simulator UI.
+
+Open the simulator panel, click the annotation button, select an element, and
+write a comment. The tweak sends that through Codex's native comment UI with:
+
+- element label and role
+- simulator id
+- element frame
+- marker point
+- viewport size
+
+This is useful for comments like "fix this button layout" or "why is this label
+truncated?" without having to describe coordinates manually.
+
+Annotations use the simulator accessibility tree where possible, so they work
+best when the app under test has useful labels and identifiers.
+
+## Notes
+
+- Screen Recording permission is not required.
+- Nothing is fetched from the network.
+- Helper binaries are compiled locally and cached under
+  `~/Library/Caches/co.bennett.ios-simulator/`.
+- Long-running helper processes are stopped when the tweak stops.
+- Simulator control is limited to the small set of commands the tweak needs.
 
 ## Files
 
-- `index.js` — renderer + main tweak entry (menu injection, tab/panel
-  mount, toolbar, mirror surface, pointer scaling, device picker, IPC
-  bridge, preflight).
-- `helpers/sim-capture.swift` — headless frame helper source.
-- `helpers/sim-input.m` — Indigo HID input helper source.
-- `manifest.json` — tweak metadata.
+- `index.js` - main Codex++ tweak.
+- `helpers/sim-capture.swift` - headless frame capture helper.
+- `helpers/sim-input.m` - touch, keyboard, and hardware-button helper.
+- `manifest.json` - tweak metadata.
 
 ## License
 
-MIT.
+MIT
