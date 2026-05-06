@@ -8,6 +8,7 @@
 // Event schema (one JSON object per line):
 //   {"type":"touch","phase":"down|move|up","x":0..1,"y":0..1}
 //   {"type":"button","name":"home|lock|side|siri","phase":"down|up"}
+//   {"type":"key","keyCode":4,"phase":"down|up"}       // USB HID keycode
 //   {"type":"tap","x":0..1,"y":0..1,"hold":150}      // convenience
 //   {"type":"button-tap","name":"home"}              // convenience
 //
@@ -109,6 +110,7 @@ typedef struct {
 
 // Indigo C-function pointer types
 typedef IndigoMessage *(*IndigoButtonFn)(int keyCode, int op, int target);
+typedef IndigoMessage *(*IndigoKeyboardFn)(int keyCode, int op);
 typedef IndigoMessage *(*IndigoMouseFn)(CGPoint *point0, CGPoint *point1, int target, int eventType, BOOL extra);
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -174,6 +176,7 @@ static id bootedDevice(id deviceSet) {
 
 static id gHidClient = nil;
 static IndigoButtonFn gButtonFn = NULL;
+static IndigoKeyboardFn gKeyboardFn = NULL;
 static IndigoMouseFn  gMouseFn  = NULL;
 static dispatch_queue_t gSendQueue;
 
@@ -191,9 +194,10 @@ static BOOL ensureHID(void) {
         return NO;
     }
     gButtonFn = (IndigoButtonFn) dlsym(kit, "IndigoHIDMessageForButton");
+    gKeyboardFn = (IndigoKeyboardFn) dlsym(kit, "IndigoHIDMessageForKeyboardArbitrary");
     gMouseFn  = (IndigoMouseFn)  dlsym(kit, "IndigoHIDMessageForMouseNSEvent");
-    if (!gButtonFn || !gMouseFn) {
-        elog(@"[sim-input] FAIL Indigo dlsym button=%p mouse=%p", gButtonFn, gMouseFn);
+    if (!gButtonFn || !gKeyboardFn || !gMouseFn) {
+        elog(@"[sim-input] FAIL Indigo dlsym button=%p keyboard=%p mouse=%p", gButtonFn, gKeyboardFn, gMouseFn);
         return NO;
     }
 
@@ -280,6 +284,13 @@ static void sendButton(NSString *name, BOOL down) {
     sendIndigo(m);
 }
 
+static void sendKey(int keyCode, BOOL down) {
+    if (!gKeyboardFn) return;
+    int op = down ? ButtonEventTypeDown : ButtonEventTypeUp;
+    IndigoMessage *m = gKeyboardFn(keyCode, op);
+    sendIndigo(m);
+}
+
 // ───────────────────────────────────────────────────────────────────────────
 // stdin event loop
 // ───────────────────────────────────────────────────────────────────────────
@@ -308,6 +319,9 @@ static void processEvent(NSDictionary *evt) {
         sendButton(name, YES);
         usleep(80000);
         sendButton(name, NO);
+    } else if ([type isEqualToString:@"key"]) {
+        NSString *phase = evt[@"phase"] ?: @"down";
+        sendKey((int)[evt[@"keyCode"] integerValue], [phase isEqualToString:@"down"]);
     } else {
         elog(@"[sim-input] unknown event type: %@", type);
     }
