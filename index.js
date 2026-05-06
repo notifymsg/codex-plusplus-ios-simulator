@@ -46,15 +46,16 @@ const PHONE_ICON =
   "</span>";
 
 const SVGS = {
-  // iOS home indicator pill
   home:
-    '<svg width="16" height="16" viewBox="0 0 20 20" fill="none" class="icon-xs"><rect x="4" y="9" width="12" height="2.2" rx="1.1" fill="currentColor"/></svg>',
+    '<svg width="16" height="16" viewBox="0 0 20 20" fill="none" class="icon-xs"><path d="M4.25 9.4 10 4.75l5.75 4.65" stroke="currentColor" stroke-width="1.55" stroke-linecap="round" stroke-linejoin="round"/><path d="M6.35 8.95v6.05h7.3V8.95" stroke="currentColor" stroke-width="1.55" stroke-linecap="round" stroke-linejoin="round"/></svg>',
   // Camera — unchanged shape, slightly heavier strokes
   camera:
     '<svg width="16" height="16" viewBox="0 0 20 20" fill="none" class="icon-xs"><path d="M7 5.5h6l1.1 1.5H16a1.5 1.5 0 0 1 1.5 1.5v6A1.5 1.5 0 0 1 16 16H4a1.5 1.5 0 0 1-1.5-1.5v-6A1.5 1.5 0 0 1 4 7h1.9L7 5.5z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/><circle cx="10" cy="11.25" r="2.5" stroke="currentColor" stroke-width="1.5"/></svg>',
   // Chevron-down for picker
   chevron:
     '<svg width="12" height="12" viewBox="0 0 20 20" fill="none" class="icon-xs"><path d="M5 8l5 5 5-5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+  check:
+    '<svg width="14" height="14" viewBox="0 0 20 20" fill="none" class="icon-xs"><path d="M4.75 10.35 8.25 13.75 15.25 6.25" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>',
   // Close X (matches native size)
   close:
     '<svg width="21" height="21" viewBox="0 0 21 21" fill="none" class="icon-xs"><path fill-rule="evenodd" clip-rule="evenodd" d="M10.8 2.485A8.333 8.333 0 1 1 10.8 19.152a8.333 8.333 0 0 1 0-16.667zM9.008 7.518a.876.876 0 0 0-1.383 1.383L9.542 10.818l-1.917 1.916a.876.876 0 1 0 1.383 1.383L10.925 12.2l1.917 1.917a.876.876 0 1 0 1.382-1.383l-1.916-1.916 1.916-1.917a.876.876 0 0 0-1.382-1.383L10.925 9.434 9.008 7.518z" fill="currentColor"/></svg>',
@@ -413,10 +414,66 @@ function registerMainHandlers(api, tweak) {
     "ios-sim:capture:stop",
     "ios-sim:input:event",
     "ios-sim:preflight",
+    "ios-sim:usage",
   ].map(ch);
 
   const firstLine = (s) =>
     ((s || "").split(/\r?\n/).map((x) => x.trim()).filter(Boolean)[0]) || "";
+
+  function isSimulatorUsageCommand(command) {
+    const first = String(command || "").trim().split(/\s+/)[0] || "";
+    const base = path.basename(first);
+    return (
+      base === "Simulator" ||
+      base === "sim-capture" ||
+      base === "sim-input" ||
+      base === "com.apple.CoreSimulator.CoreSimulatorService" ||
+      command.includes("/Simulator.app/") ||
+      command.includes("/CoreSimulator.framework/")
+    );
+  }
+
+  function sampleSimulatorUsage() {
+    return new Promise((resolve) => {
+      const p = spawn("/bin/ps", ["-axo", "pid=,pcpu=,rss=,command="], {
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      let out = "";
+      let err = "";
+      p.stdout.on("data", (b) => (out += b.toString("utf8")));
+      p.stderr.on("data", (b) => (err += b.toString("utf8")));
+      p.on("error", (e) => resolve({ ok: false, error: String(e) }));
+      p.on("exit", (code) => {
+        if (code !== 0) {
+          resolve({ ok: false, code, stderr: firstLine(err) });
+          return;
+        }
+        const processes = [];
+        for (const line of out.split(/\r?\n/)) {
+          const m = line.trim().match(/^(\d+)\s+([\d.]+)\s+(\d+)\s+(.+)$/);
+          if (!m) continue;
+          const command = m[4] || "";
+          if (!isSimulatorUsageCommand(command)) continue;
+          processes.push({
+            pid: Number(m[1]),
+            cpu: Number(m[2]) || 0,
+            rssKb: Number(m[3]) || 0,
+            command: command.slice(0, 180),
+          });
+        }
+        const cpu = processes.reduce((sum, proc) => sum + proc.cpu, 0);
+        const rssBytes =
+          processes.reduce((sum, proc) => sum + proc.rssKb, 0) * 1024;
+        resolve({
+          ok: true,
+          cpu,
+          rssBytes,
+          processCount: processes.length,
+          processes: processes.slice(0, 12),
+        });
+      });
+    });
+  }
 
   for (const c of channels) {
     try {
@@ -757,6 +814,8 @@ function registerMainHandlers(api, tweak) {
     });
   });
 
+  ipcMain.handle(ch("ios-sim:usage"), async () => sampleSimulatorUsage());
+
   ipcMain.handle(ch("ios-sim:capture:start"), async () => {
     const r = startCapture();
     if (capture.lastMeta) {
@@ -883,6 +942,98 @@ function injectStyles() {
     }
     [${TWEAK_ATTR}="toolbar-button"]:hover {
       background: var(--color-token-list-hover-background, color-mix(in oklab, var(--color-token-text-primary) 8%, transparent));
+    }
+    [${TWEAK_ATTR}="usage"] {
+      display: inline-flex;
+      align-items: center;
+      height: var(--token-button-composer-height, 28px);
+      padding: 0 0.55rem;
+      border-radius: 999px;
+      border: 1px solid var(--color-token-border-default, var(--color-token-border));
+      color: var(--color-token-text-tertiary, var(--color-token-text-secondary));
+      background: color-mix(in oklab, var(--color-token-text-primary) 4%, transparent);
+      font-size: 0.75rem;
+      line-height: 1;
+      white-space: nowrap;
+    }
+    [${TWEAK_ATTR}="device-popover"] {
+      position: fixed;
+      z-index: 9999;
+      width: 320px;
+      max-height: min(480px, calc(100vh - 80px));
+      overflow-y: auto;
+      padding: 0.35rem;
+      border: 1px solid var(--color-token-border-default, var(--color-token-border));
+      border-radius: 0.75rem;
+      background: var(--color-token-bg-elevated, var(--color-token-main-surface-primary));
+      color: var(--color-token-text-primary);
+      box-shadow: 0 16px 44px rgba(0, 0, 0, 0.22);
+      font-size: 0.875rem;
+    }
+    [${TWEAK_ATTR}="device-popover-header"] {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 0.5rem;
+      padding: 0.45rem 0.55rem 0.5rem;
+      color: var(--color-token-text-secondary);
+      font-weight: 500;
+    }
+    [${TWEAK_ATTR}="device-runtime"] {
+      padding: 0.5rem 0.55rem 0.25rem;
+      color: var(--color-token-text-tertiary, var(--color-token-text-secondary));
+      font-size: 0.6875rem;
+      font-weight: 600;
+      letter-spacing: 0;
+      text-transform: uppercase;
+    }
+    [${TWEAK_ATTR}="device-list"] {
+      display: flex;
+      flex-direction: column;
+      gap: 0.125rem;
+    }
+    [${TWEAK_ATTR}="device-item"] {
+      display: grid;
+      grid-template-columns: 1rem minmax(0, 1fr) auto;
+      align-items: center;
+      width: 100%;
+      gap: 0.55rem;
+      min-height: 2.25rem;
+      padding: 0.4rem 0.55rem;
+      border: 0;
+      border-radius: 0.5rem;
+      color: var(--color-token-text-primary);
+      background: transparent;
+      cursor: pointer;
+      text-align: left;
+    }
+    [${TWEAK_ATTR}="device-item"]:hover {
+      background: var(--color-token-list-hover-background, color-mix(in oklab, var(--color-token-text-primary) 8%, transparent));
+    }
+    [${TWEAK_ATTR}="device-item"][data-booted="true"] {
+      background: color-mix(in oklab, var(--color-token-text-primary) 7%, transparent);
+    }
+    [${TWEAK_ATTR}="device-name"] {
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    [${TWEAK_ATTR}="device-state"] {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.3rem;
+      color: var(--color-token-text-tertiary, var(--color-token-text-secondary));
+      font-size: 0.75rem;
+      white-space: nowrap;
+    }
+    [${TWEAK_ATTR}="device-state"][data-booted="true"] {
+      color: var(--color-token-success, #34c759);
+    }
+    [${TWEAK_ATTR}="device-empty"] {
+      padding: 0.75rem 0.6rem;
+      color: var(--color-token-text-tertiary, var(--color-token-text-secondary));
+      font-size: 0.8125rem;
     }
     [${TWEAK_ATTR}="status"] {
       margin-top: 0.5rem;
@@ -1534,6 +1685,11 @@ function createPanel(api) {
   spacer.className = "flex-1";
   toolbar.appendChild(spacer);
 
+  const usage = makeUsagePill();
+  toolbar.appendChild(usage);
+  panel.__codexppIosSimUsage = usage;
+  startUsagePolling(panel, api);
+
   const devicePickerButton = makeDevicePickerButton(panel, api);
   toolbar.appendChild(devicePickerButton);
   panel.__codexppIosSimDevicePickerButton = devicePickerButton;
@@ -1725,6 +1881,58 @@ function makeToolbarButton({ label, icon, text, onClick }) {
   return b;
 }
 
+function makeUsagePill() {
+  const node = document.createElement("div");
+  node.setAttribute(TWEAK_ATTR, "usage");
+  node.setAttribute("aria-label", "Simulator CPU and memory usage");
+  node.textContent = "CPU --  RAM --";
+  return node;
+}
+
+function startUsagePolling(panel, api) {
+  if (panel.__codexppIosSimUsageTimer) return;
+  const tick = () => {
+    if (!panel.isConnected) {
+      panel.__codexppIosSimStopUsage?.();
+      return;
+    }
+    if (panel.style.display === "none" || panel.hidden) return;
+    updateUsagePill(panel, api).catch((err) =>
+      api.log?.warn?.("ios-sim usage update failed", String(err)),
+    );
+  };
+  panel.__codexppIosSimUsageTimer = window.setInterval(tick, 2_000);
+  panel.__codexppIosSimStopUsage = () => {
+    if (panel.__codexppIosSimUsageTimer) {
+      window.clearInterval(panel.__codexppIosSimUsageTimer);
+    }
+    panel.__codexppIosSimUsageTimer = null;
+    panel.__codexppIosSimStopUsage = null;
+  };
+  tick();
+}
+
+async function updateUsagePill(panel, api) {
+  const node = panel.__codexppIosSimUsage;
+  if (!node) return;
+  const res = await api.ipc.invoke("ios-sim:usage");
+  if (!res?.ok) {
+    node.textContent = "CPU --  RAM --";
+    node.title = res?.error || res?.stderr || "Usage unavailable";
+    return;
+  }
+  const cpu = Number(res.cpu) || 0;
+  const cpuText = cpu >= 10 ? cpu.toFixed(0) : cpu.toFixed(1);
+  node.textContent = `CPU ${cpuText}%  RAM ${formatBytes(res.rssBytes || 0)}`;
+  node.title = `${res.processCount || 0} simulator process${res.processCount === 1 ? "" : "es"}`;
+}
+
+function formatBytes(bytes) {
+  const n = Number(bytes) || 0;
+  if (n >= 1024 * 1024 * 1024) return `${(n / (1024 * 1024 * 1024)).toFixed(1)} GB`;
+  return `${Math.round(n / (1024 * 1024))} MB`;
+}
+
 function activateSimPanel(panelHost, tab, panel) {
   setPanelOpen(true);
   syncNativeTabSelection(panelHost, null);
@@ -1848,6 +2056,7 @@ function removeSimPanel(options = {}) {
   setPanelOpen(false, options);
   const panelHost = findRightTablist()?.closest(".flex.h-full.min-h-0.flex-col");
   if (panelHost instanceof HTMLElement) deactivateSimPanel(panelHost, options);
+  document.querySelector(`[${TWEAK_ATTR}="tabpanel"]`)?.__codexppIosSimStopUsage?.();
   document.querySelector(`[${TWEAK_ATTR}="side-tab"]`)?.remove();
   document.querySelector(`[${TWEAK_ATTR}="tabpanel"]`)?.remove();
 }
@@ -1963,41 +2172,59 @@ async function openDevicePicker(panel, api) {
   pop.setAttribute(TWEAK_ATTR, "device-popover");
   pop.setAttribute("role", "menu");
   pop.tabIndex = -1;
-  // Use fixed positioning since getBoundingClientRect returns viewport coords
-  // and there's no guarantee body has a positioned ancestor.
-  pop.className =
-    "fixed z-[9999] max-h-[420px] min-w-[260px] overflow-y-auto rounded-lg border border-token-border bg-token-main-surface-primary py-1 shadow-xl text-sm";
   const br = button.getBoundingClientRect();
-  pop.style.position = "fixed";
   pop.style.top = br.bottom + 4 + "px";
   pop.style.right = (window.innerWidth - br.right) + "px";
-  pop.style.zIndex = "9999";
+
+  const bootedCount = runtimes.reduce((count, rt) => {
+    return count + (res.data.devices[rt] || []).filter((d) => d.state === "Booted").length;
+  }, 0);
+  const header = document.createElement("div");
+  header.setAttribute(TWEAK_ATTR, "device-popover-header");
+  const title = document.createElement("span");
+  title.textContent = "iOS Simulators";
+  const summary = document.createElement("span");
+  summary.className = "text-xs text-token-text-tertiary";
+  summary.textContent = bootedCount ? `${bootedCount} booted` : "None booted";
+  header.append(title, summary);
+  pop.appendChild(header);
 
   let anyShown = false;
   for (const rt of runtimes) {
     const list = (res.data.devices[rt] || []).filter((d) => d.isAvailable);
     if (!list.length) continue;
     anyShown = true;
-    const header = document.createElement("div");
-    header.className =
-      "px-3 py-1 text-xs font-medium text-token-text-tertiary uppercase tracking-wide";
-    header.textContent = rt.replace(/^com\.apple\.CoreSimulator\.SimRuntime\./, "").replace(/-/g, " ");
-    pop.appendChild(header);
+    const runtimeHeader = document.createElement("div");
+    runtimeHeader.setAttribute(TWEAK_ATTR, "device-runtime");
+    runtimeHeader.textContent = formatRuntimeName(rt);
+    pop.appendChild(runtimeHeader);
+
+    const group = document.createElement("div");
+    group.setAttribute(TWEAK_ATTR, "device-list");
+    pop.appendChild(group);
+
     for (const d of list) {
+      const booted = d.state === "Booted";
       const item = document.createElement("button");
       item.type = "button";
       item.setAttribute("role", "menuitem");
       item.setAttribute(TWEAK_ATTR, "device-item");
-      item.className =
-        "flex w-full items-center justify-between gap-2 px-3 py-1.5 text-left hover:bg-token-list-hover-background";
-      const left = document.createElement("span");
-      left.className = "truncate";
-      left.textContent = d.name;
-      const right = document.createElement("span");
-      right.className = "shrink-0 text-xs text-token-text-tertiary";
-      right.textContent = d.state === "Booted" ? "● Booted" : "";
-      if (d.state === "Booted") right.style.color = "var(--color-token-success, #34c759)";
-      item.append(left, right);
+      item.dataset.booted = booted ? "true" : "false";
+
+      const check = document.createElement("span");
+      check.className = "flex items-center justify-center";
+      check.innerHTML = booted ? SVGS.check : "";
+
+      const name = document.createElement("span");
+      name.setAttribute(TWEAK_ATTR, "device-name");
+      name.textContent = d.name;
+
+      const state = document.createElement("span");
+      state.setAttribute(TWEAK_ATTR, "device-state");
+      state.dataset.booted = booted ? "true" : "false";
+      state.textContent = booted ? "Booted" : d.state || "";
+
+      item.append(check, name, state);
       item.addEventListener("click", async (e) => {
         e.preventDefault();
         e.stopPropagation();
@@ -2011,13 +2238,13 @@ async function openDevicePicker(panel, api) {
           api.log?.error?.("ios-sim selectDevice threw", String(err));
         }
       });
-      pop.appendChild(item);
+      group.appendChild(item);
     }
   }
 
   if (!anyShown) {
     const empty = document.createElement("div");
-    empty.className = "px-3 py-2 text-token-text-tertiary";
+    empty.setAttribute(TWEAK_ATTR, "device-empty");
     empty.textContent = "No iOS simulators available.";
     pop.appendChild(empty);
   }
@@ -2039,6 +2266,14 @@ async function openDevicePicker(panel, api) {
     document.removeEventListener("mousedown", dismiss, true);
   };
   setTimeout(() => document.addEventListener("mousedown", dismiss, true), 0);
+}
+
+function formatRuntimeName(runtime) {
+  const raw = String(runtime || "")
+    .replace(/^com\.apple\.CoreSimulator\.SimRuntime\./, "");
+  const ios = raw.match(/^iOS-(\d+)-(\d+)$/);
+  if (ios) return `iOS ${ios[1]}.${ios[2]}`;
+  return raw.replace(/-/g, " ");
 }
 
 async function selectDevice(panel, api, device) {
