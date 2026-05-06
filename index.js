@@ -35,15 +35,33 @@ const TABLIST_WIRE_VERSION = "ios-sim-tab-selection-v2";
 const MESSAGE_FOR_VIEW = "codex_desktop:message-for-view";
 const MENU_LABEL = "iOS Simulator";
 const PANEL_LABEL = "iOS Simulator";
-const BROWSER_PATTERNS = [/^browser$/i, /^browser use$/i, /\bbrowser\b/i];
+const BROWSER_PATTERNS = [
+  /^browser$/i,
+  /^browser use$/i,
+  /\bbrowser\b/i,
+  /浏览器/,
+  /瀏覽器/,
+];
 const MENU_ANCHOR_PATTERNS = [
   ...BROWSER_PATTERNS,
   /^open$/i,
   /^open file\b/i,
   /^new chat\b/i,
   /^browse files\b/i,
+  /打开文件/,
+  /開啟檔案/,
+  /新(建)?聊天/,
+  /新(建)?对话/,
 ];
-const PICKER_TITLE_PATTERNS = [/^new chat$/i, /^open file$/i, /^browse files$/i];
+const PICKER_TITLE_PATTERNS = [
+  /^new chat$/i,
+  /^open file$/i,
+  /^browse files$/i,
+  /打开文件/,
+  /開啟檔案/,
+  /新(建)?聊天/,
+  /新(建)?对话/,
+];
 const PICKER_SUBTITLE = "Mirror the iOS Simulator in this pane";
 const DEFAULT_AUTO_BOOT = true;
 const OPEN_SHORTCUT_LABEL = "⌘Y";
@@ -623,6 +641,7 @@ function registerMainHandlers(api, tweak) {
       } catch {}
       capture.proc = null;
     }
+    stopInput("capture-stop");
     capture.starting = false;
     // Drop cached meta — otherwise the next start() re-broadcasts stale meta
     // (wrong device) before the fresh helper has emitted its own stream-started.
@@ -678,12 +697,25 @@ function registerMainHandlers(api, tweak) {
         if (m) {
           try {
             const meta = JSON.parse(m[1]);
+            if (meta.type === "no-booted-device") {
+              capture.lastMeta = null;
+              stopInput("capture-no-booted-device");
+              broadcast(META_CHANNEL, meta);
+              continue;
+            }
             capture.lastMeta = meta;
+            if (meta.deviceUDID && input.proc && input.udid !== meta.deviceUDID) {
+              stopInput("capture-device-changed");
+            }
             broadcast(META_CHANNEL, meta);
           } catch (e) {
             api.log?.warn?.("ios-sim meta parse", e, line);
           }
         } else {
+          if (/booted device gone/i.test(line)) {
+            capture.lastMeta = null;
+            stopInput("capture-device-gone");
+          }
           api.log?.info?.("[sim-capture]", line);
         }
       }
@@ -709,7 +741,11 @@ function registerMainHandlers(api, tweak) {
 
   const input = (globalThis.__codexppIosSimInput = globalThis.__codexppIosSimInput || {
     proc: null,
+    udid: null,
+    eventQueue: Promise.resolve(),
   });
+  input.udid = input.udid || null;
+  input.eventQueue = input.eventQueue || Promise.resolve();
 
   function ensureInputBinary() {
     if (!fs.existsSync(inputSrc)) return { ok: false, error: "missing sim-input.m" };
@@ -734,11 +770,15 @@ function registerMainHandlers(api, tweak) {
     return { ok: true };
   }
 
-  function ensureInputProc() {
-    if (input.proc && !input.proc.killed) return { ok: true };
+  function ensureInputProc(udid) {
+    const targetUDID = udid || null;
+    if (input.proc && !input.proc.killed && input.udid === targetUDID) return { ok: true };
+    if (input.proc && input.udid !== targetUDID) {
+      stopInput("target-device-changed");
+    }
     const built = ensureInputBinary();
     if (!built.ok) return built;
-    const proc = spawn(inputBin, [], { stdio: ["pipe", "ignore", "pipe"] });
+    const proc = spawn(inputBin, targetUDID ? [targetUDID] : [], { stdio: ["pipe", "ignore", "pipe"] });
     let stderrBuf = "";
     proc.stderr.on("data", (b) => {
       stderrBuf += b.toString("utf8");
@@ -746,37 +786,106 @@ function registerMainHandlers(api, tweak) {
       while ((nl = stderrBuf.indexOf("\n")) >= 0) {
         const line = stderrBuf.slice(0, nl);
         stderrBuf = stderrBuf.slice(nl + 1);
-        if (line.trim()) api.log?.info?.("[sim-input]", line.trim());
+        const trimmed = line.trim();
+        if (trimmed) {
+          api.log?.info?.("[sim-input]", trimmed);
+          if (/machPortInvalid/i.test(trimmed)) {
+            stopInput("input-mach-port-invalid");
+          }
+        }
       }
     });
     proc.on("error", (e) => {
       api.log?.error?.("sim-input error", e);
       input.proc = null;
+      input.udid = null;
     });
     proc.on("exit", (code, sig) => {
       api.log?.info?.("sim-input exit", code, sig);
-      if (input.proc === proc) input.proc = null;
+      if (input.proc === proc) {
+        input.proc = null;
+        input.udid = null;
+      }
     });
     input.proc = proc;
+    input.udid = targetUDID;
     return { ok: true };
   }
 
-  function stopInput() {
+  function stopInput(reason) {
     if (input.proc) {
+      if (reason) api.log?.info?.("ios-sim stopping input helper", reason);
       try { input.proc.kill("SIGTERM"); } catch {}
       input.proc = null;
+    }
+    input.udid = null;
+  }
+
+  function writeInputEvent(event) {
+    input.proc.stdin.write(JSON.stringify(event) + "\n");
+  }
+
+  function enqueueInputOperation(fn) {
+    const previous = input.eventQueue || Promise.resolve();
+    const next = previous.catch(() => {}).then(fn);
+    input.eventQueue = next;
+    return next;
+  }
+
+  function pbcopyToDevice(udid, text) {
+    const device = udid || "booted";
+    return new Promise((resolve) => {
+      const p = spawn("xcrun", ["simctl", "pbcopy", device], {
+        stdio: ["pipe", "ignore", "pipe"],
+      });
+      let err = "";
+      p.stderr.on("data", (b) => (err += b.toString("utf8")));
+      p.on("error", (e) => resolve({ ok: false, error: String(e?.message || e) }));
+      p.on("exit", (code) => {
+        resolve({ ok: code === 0, code, error: code === 0 ? null : firstLine(err) || `pbcopy exit ${code}` });
+      });
+      try {
+        p.stdin.end(String(text || ""));
+      } catch (e) {
+        resolve({ ok: false, error: String(e?.message || e) });
+      }
+    });
+  }
+
+  async function sendTextInput(targetUDID, text) {
+    const value = String(text || "");
+    if (!value) return { ok: true };
+    if (value.length > 4096) return { ok: false, error: "text input too long" };
+
+    const copied = await pbcopyToDevice(targetUDID, value);
+    if (!copied.ok) return copied;
+
+    const r = ensureInputProc(targetUDID);
+    if (!r.ok) return r;
+    writeInputEvent({ type: "key-tap", usage: 0x19, modifiers: [0xe3] });
+    return { ok: true };
+  }
+
+  function sendHelperInputEvent(targetUDID, event) {
+    const r = ensureInputProc(targetUDID);
+    if (!r.ok) return r;
+    try {
+      writeInputEvent(event);
+      return { ok: true };
+    } catch (e) {
+      return { ok: false, error: String(e?.message || e) };
     }
   }
 
   ipcMain.handle(ch("ios-sim:input:event"), async (_evt, event) => {
-    const r = ensureInputProc();
-    if (!r.ok) return r;
-    try {
-      input.proc.stdin.write(JSON.stringify(event) + "\n");
-      return { ok: true };
-    } catch (e) {
-      return { ok: false, error: String(e) };
+    const targetUDID = event?.deviceUDID || capture.lastMeta?.deviceUDID || null;
+    if (event?.type === "text") {
+      return enqueueInputOperation(() => sendTextInput(targetUDID, event.text));
     }
+    if (event?.type === "keyboard" || event?.type === "key-tap") {
+      return enqueueInputOperation(() => sendHelperInputEvent(targetUDID, event));
+    }
+    return sendHelperInputEvent(targetUDID, event);
   });
 
   // Quit Simulator.app so booting a device doesn't pop up an attached window.
@@ -1984,10 +2093,12 @@ function deactivateNativeSimPanel(options = {}) {
   clearSimulatorDebugOverlays();
   if (panel instanceof HTMLElement) {
     panel.style.display = "none";
+    panel.__codexppIosSimDeactivateKeyboard?.();
     try {
       panel.__codexppIosSimDetachCapture?.();
     } catch {}
     if (options.removePanel) {
+      panel.__codexppIosSimDisposeKeyboard?.();
       panel.__codexppIosSimStopUsage?.();
       panel.remove();
     }
@@ -2479,12 +2590,14 @@ function createPanel(api) {
     return { x, y };
   }
   function send(event) {
-    try { api.ipc.invoke("ios-sim:input:event", event).catch(() => {}); } catch {}
+    const deviceUDID = panel.__codexppIosSimMeta?.deviceUDID;
+    const payload = deviceUDID && !event.deviceUDID ? { ...event, deviceUDID } : event;
+    try { api.ipc.invoke("ios-sim:input:event", payload).catch(() => {}); } catch {}
   }
-  installKeyboardForwarding(panel, api);
+  installKeyboardForwarding(panel, stage, send);
   mirror.addEventListener("pointerdown", (e) => {
     if (e.button !== 0) return;
-    panel.focus({ preventScroll: true });
+    panel.__codexppIosSimActivateKeyboard?.();
     const r = imgRatio(e); if (!r) return;
     pointerDown = true;
     activePointerId = e.pointerId;
@@ -2590,6 +2703,7 @@ function createPanel(api) {
   globalThis.__codexppIosSimLastCreate = Date.now();
   panel.__codexppIosSimDetachCapture = () => {
     if (!panel.__codexppIosSimCaptureAttached) return;
+    panel.__codexppIosSimDeactivateKeyboard?.();
     panel.__codexppIosSimCaptureAttached = false;
     for (const off of panel.__codexppIosSimCaptureOff || []) {
       try {
@@ -2650,47 +2764,213 @@ const HID_KEY_BY_CODE = {
   Backslash: 49, Semicolon: 51, Quote: 52, Backquote: 53,
   Comma: 54, Period: 55, Slash: 56,
   ArrowRight: 79, ArrowLeft: 80, ArrowDown: 81, ArrowUp: 82,
+  Home: 0x4a, PageUp: 0x4b, Delete: 0x4c, End: 0x4d, PageDown: 0x4e,
 };
 
 const HID_LEFT_SHIFT = 225;
+const HID_MODIFIER_BY_KEY = {
+  Control: 0xe0,
+  Shift: HID_LEFT_SHIFT,
+  Alt: 0xe2,
+  Meta: 0xe3,
+};
+const HID_KEY_BY_KEY = {
+  Enter: 0x28,
+  Escape: 0x29,
+  Backspace: 0x2a,
+  Tab: 0x2b,
+  " ": 0x2c,
+  Delete: 0x4c,
+  ArrowRight: 0x4f,
+  ArrowLeft: 0x50,
+  ArrowDown: 0x51,
+  ArrowUp: 0x52,
+};
 
-function installKeyboardForwarding(panel, api) {
+function installKeyboardForwarding(panel, stage, send) {
   if (panel.__codexppIosSimKeyboardForwarding) return;
   panel.__codexppIosSimKeyboardForwarding = true;
-  const handleKeyDown = (event) => {
-    if (event.defaultPrevented || event.isComposing) return;
-    if (isEditableKeyboardTarget(event.target)) return;
-    if (event.metaKey || event.ctrlKey || event.altKey) return;
-    if (forwardKeyboardCode(panel, api, event.code, event.shiftKey)) {
-      event.preventDefault();
-      event.stopPropagation();
+
+  const sink = document.createElement("textarea");
+  sink.setAttribute(TWEAK_ATTR, "keyboard-sink");
+  sink.setAttribute("aria-hidden", "true");
+  sink.autocapitalize = "off";
+  sink.autocomplete = "off";
+  sink.spellcheck = false;
+  sink.tabIndex = -1;
+  sink.style.position = "absolute";
+  sink.style.width = "1px";
+  sink.style.height = "1px";
+  sink.style.opacity = "0";
+  sink.style.pointerEvents = "none";
+  sink.style.left = "50%";
+  sink.style.top = "50%";
+  sink.style.resize = "none";
+  sink.style.border = "0";
+  sink.style.padding = "0";
+  sink.style.outline = "0";
+  stage.appendChild(sink);
+
+  let keyboardActive = false;
+  let composing = false;
+  let queuedText = "";
+  let textTimer = null;
+
+  const focusSink = () => {
+    try { sink.focus({ preventScroll: true }); } catch { try { sink.focus(); } catch {} }
+  };
+  const stopEvent = (event, preventDefault = true) => {
+    if (preventDefault) event.preventDefault();
+    event.stopPropagation();
+    event.stopImmediatePropagation?.();
+  };
+  const flushText = () => {
+    if (textTimer) {
+      clearTimeout(textTimer);
+      textTimer = null;
+    }
+    const text = queuedText;
+    queuedText = "";
+    if (text) send({ type: "text", text });
+  };
+  const queueText = (text) => {
+    if (!text) return;
+    queuedText += text;
+    if (textTimer) clearTimeout(textTimer);
+    textTimer = setTimeout(flushText, 30);
+  };
+  const sendKeyTap = (usage, modifiers = []) => {
+    flushText();
+    send({ type: "key-tap", usage, modifiers });
+  };
+  const activate = () => {
+    if (!isSimPanelAcceptingKeyboard(panel)) return;
+    keyboardActive = true;
+    focusSink();
+  };
+  const deactivate = () => {
+    flushText();
+    keyboardActive = false;
+    composing = false;
+    sink.value = "";
+    if (document.activeElement === sink) {
+      try { sink.blur(); } catch {}
     }
   };
-  panel.addEventListener("keydown", handleKeyDown, true);
-  document.addEventListener("keydown", handleKeyDown, true);
-}
+  const active = () => keyboardActive && isSimPanelAcceptingKeyboard(panel);
 
-function isEditableKeyboardTarget(target) {
-  if (!(target instanceof Element)) return false;
-  if (target.closest?.(`[${TWEAK_ATTR}="annotation-comment"]`)) return true;
-  if (target.closest?.('[contenteditable="true"]')) return true;
-  const tag = target.tagName?.toLowerCase?.();
-  return tag === "input" || tag === "textarea" || tag === "select";
-}
+  panel.__codexppIosSimActivateKeyboard = activate;
+  panel.__codexppIosSimDeactivateKeyboard = deactivate;
 
-function forwardKeyboardCode(panel, api, code, shiftKey) {
-  if (!isSimPanelAcceptingKeyboard(panel)) return false;
-  const keyCode = HID_KEY_BY_CODE[code];
-  if (!keyCode) return false;
-  const useShift = Boolean(shiftKey && keyCode !== HID_LEFT_SHIFT);
-  const send = (payload) => {
-    try { api.ipc.invoke("ios-sim:input:event", payload).catch(() => {}); } catch {}
+  const onBeforeInput = (event) => {
+    if (!active()) return;
+    if (event.inputType === "insertCompositionText") return;
+    if (event.inputType === "insertText" || event.inputType === "insertReplacementText") {
+      stopEvent(event);
+      queueText(event.data || sink.value);
+      sink.value = "";
+      return;
+    }
+    if (event.inputType === "insertLineBreak") {
+      stopEvent(event);
+      sendKeyTap(HID_KEY_BY_KEY.Enter);
+      return;
+    }
+    if (event.inputType === "deleteContentBackward") {
+      stopEvent(event);
+      sendKeyTap(HID_KEY_BY_KEY.Backspace);
+      return;
+    }
+    if (event.inputType === "deleteContentForward") {
+      stopEvent(event);
+      sendKeyTap(HID_KEY_BY_KEY.Delete);
+    }
   };
-  if (useShift) send({ type: "key", keyCode: HID_LEFT_SHIFT, phase: "down" });
-  send({ type: "key", keyCode, phase: "down" });
-  send({ type: "key", keyCode, phase: "up" });
-  if (useShift) send({ type: "key", keyCode: HID_LEFT_SHIFT, phase: "up" });
-  return true;
+
+  const onInput = () => {
+    if (!active() || composing) return;
+    const text = sink.value;
+    sink.value = "";
+    queueText(text);
+  };
+
+  const onCompositionStart = () => {
+    if (active()) composing = true;
+  };
+
+  const onCompositionEnd = (event) => {
+    if (!active()) return;
+    composing = false;
+    const text = event.data || sink.value;
+    sink.value = "";
+    queueText(text);
+  };
+
+  const onPaste = (event) => {
+    if (!active()) return;
+    const text = event.clipboardData?.getData("text/plain") || "";
+    if (!text) return;
+    stopEvent(event);
+    queueText(text);
+  };
+
+  const onDocumentMouseDown = (event) => {
+    if (!keyboardActive) return;
+    const target = event.target instanceof Node ? event.target : null;
+    if (target && panel.contains(target)) return;
+    deactivate();
+  };
+
+  const onDocumentKeyDown = (event) => {
+    if (!active()) return;
+    if (event.target !== sink && isEditableKeyboardTarget(event.target)) {
+      deactivate();
+      return;
+    }
+    if (document.activeElement !== sink) focusSink();
+
+    if (event.isComposing || composing) {
+      stopEvent(event, false);
+      return;
+    }
+
+    const usage = hidUsageForKeyboardEvent(event);
+    const printable = event.key && event.key.length === 1 && !event.metaKey && !event.ctrlKey;
+    if (printable) {
+      if (event.target === sink) {
+        stopEvent(event, false);
+      } else {
+        stopEvent(event);
+        queueText(event.key);
+      }
+      return;
+    }
+
+    if (!usage) return;
+    stopEvent(event);
+    sendKeyTap(usage, hidModifierUsagesForEvent(event));
+  };
+
+  sink.addEventListener("beforeinput", onBeforeInput);
+  sink.addEventListener("input", onInput);
+  sink.addEventListener("compositionstart", onCompositionStart);
+  sink.addEventListener("compositionend", onCompositionEnd);
+  sink.addEventListener("paste", onPaste);
+  document.addEventListener("mousedown", onDocumentMouseDown, true);
+  document.addEventListener("keydown", onDocumentKeyDown, true);
+
+  panel.__codexppIosSimDisposeKeyboard = () => {
+    deactivate();
+    sink.removeEventListener("beforeinput", onBeforeInput);
+    sink.removeEventListener("input", onInput);
+    sink.removeEventListener("compositionstart", onCompositionStart);
+    sink.removeEventListener("compositionend", onCompositionEnd);
+    sink.removeEventListener("paste", onPaste);
+    document.removeEventListener("mousedown", onDocumentMouseDown, true);
+    document.removeEventListener("keydown", onDocumentKeyDown, true);
+    sink.remove();
+    panel.__codexppIosSimKeyboardForwarding = false;
+  };
 }
 
 function isSimPanelAcceptingKeyboard(panel) {
@@ -2701,6 +2981,38 @@ function isSimPanelAcceptingKeyboard(panel) {
   const rect = panel.getBoundingClientRect();
   if (rect.width <= 0 || rect.height <= 0) return false;
   return true;
+}
+
+function isEditableKeyboardTarget(target) {
+  if (!(target instanceof Element)) return false;
+  if (target.closest?.(`[${TWEAK_ATTR}="annotation-comment"]`)) return true;
+  if (target.closest?.('[contenteditable="true"]')) return true;
+  const tag = target.tagName?.toLowerCase?.();
+  return tag === "input" || tag === "textarea" || tag === "select";
+}
+
+function hidUsageForKeyboardEvent(event) {
+  if (!event) return null;
+  if (Object.prototype.hasOwnProperty.call(HID_KEY_BY_KEY, event.key)) {
+    return HID_KEY_BY_KEY[event.key];
+  }
+  if (Object.prototype.hasOwnProperty.call(HID_KEY_BY_CODE, event.code)) {
+    return HID_KEY_BY_CODE[event.code];
+  }
+  if (Object.prototype.hasOwnProperty.call(HID_MODIFIER_BY_KEY, event.key)) {
+    return HID_MODIFIER_BY_KEY[event.key];
+  }
+  return null;
+}
+
+function hidModifierUsagesForEvent(event) {
+  const usage = hidUsageForKeyboardEvent(event);
+  const modifiers = [];
+  if (event.ctrlKey && usage !== HID_MODIFIER_BY_KEY.Control) modifiers.push(HID_MODIFIER_BY_KEY.Control);
+  if (event.shiftKey && usage !== HID_MODIFIER_BY_KEY.Shift) modifiers.push(HID_MODIFIER_BY_KEY.Shift);
+  if (event.altKey && usage !== HID_MODIFIER_BY_KEY.Alt) modifiers.push(HID_MODIFIER_BY_KEY.Alt);
+  if (event.metaKey && usage !== HID_MODIFIER_BY_KEY.Meta) modifiers.push(HID_MODIFIER_BY_KEY.Meta);
+  return modifiers;
 }
 
 function makeUsagePill() {
@@ -3012,6 +3324,7 @@ function deactivateSimPanel(panelHost, options = {}) {
   tab?.classList.add("text-token-text-secondary");
   if (panel instanceof HTMLElement) {
     panel.style.display = "none";
+    panel.__codexppIosSimDeactivateKeyboard?.();
     try {
       panel.__codexppIosSimDetachCapture?.();
     } catch {}
@@ -3057,6 +3370,7 @@ function removeSimPanel(options = {}) {
     if (panelHost instanceof HTMLElement) deactivateSimPanel(panelHost, options);
   }
   document.querySelector(`[${TWEAK_ATTR}="tabpanel"]`)?.__codexppIosSimStopUsage?.();
+  document.querySelector(`[${TWEAK_ATTR}="tabpanel"]`)?.__codexppIosSimDisposeKeyboard?.();
   document.querySelector(`[${TWEAK_ATTR}="side-tab"]`)?.remove();
   document.querySelector(`[${TWEAK_ATTR}="tabpanel"]`)?.remove();
 }
@@ -3112,9 +3426,11 @@ function findRightTablist() {
 async function onHardwareButton(panel, api, button) {
   const map = { home: "home", lock: "lock", side: "side", siri: "siri" };
   const name = map[button] || "home";
+  const deviceUDID = panel.__codexppIosSimMeta?.deviceUDID;
   const res = await api.ipc.invoke("ios-sim:input:event", {
     type: "button-tap",
     name,
+    ...(deviceUDID ? { deviceUDID } : {}),
   });
   if (!res?.ok) setStatus(panel, `${button} failed: ${res?.error || "?"}`);
   else api.log?.info?.("ios-sim button", name);
@@ -3532,6 +3848,7 @@ function selectAnnotationTarget(panel, target, item, event) {
 function showAnnotationComment(panel, target, item) {
   const overlay = panel.__codexppIosSimAnnotationOverlay;
   if (!overlay) return;
+  panel.__codexppIosSimDeactivateKeyboard?.();
   clearAnnotationComment(panel);
   panel.__codexppIosSimAnnotationSelectedTarget = target;
   panel.__codexppIosSimAnnotationCommentOpen = true;
